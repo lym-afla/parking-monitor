@@ -139,7 +139,7 @@ health_check() {
         fi
 
         # Check if state file is valid JSON
-        if python -m json.tool "$STATE_PATH" >/dev/null 2>&1; then
+        if $VENV_PATH/bin/python -m json.tool "$STATE_PATH" >/dev/null 2>&1; then
             echo "✅ State file is valid JSON"
         else
             echo "❌ State file is corrupted"
@@ -442,7 +442,7 @@ check_parking_status() {
     echo -e "${CYAN}Current State:${NC}"
 
     # Use Python to parse JSON nicely
-    python -c "
+    $VENV_PATH/bin/python -c "
 import json
 import sys
 from datetime import datetime
