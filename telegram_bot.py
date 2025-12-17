@@ -269,19 +269,29 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "status":
         message = format_status_message(s)
-        await query.edit_message_text(
-            text=message,
-            reply_markup=create_main_keyboard(),
-            parse_mode="Markdown"
-        )
+        try:
+            await query.edit_message_text(
+                text=message,
+                reply_markup=create_main_keyboard(),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            # Ignore "message is not modified" error
+            if "message is not modified" not in str(e).lower():
+                raise
 
     elif data == "stats":
         message = format_stats_message(s)
-        await query.edit_message_text(
-            text=message,
-            reply_markup=create_main_keyboard(),
-            parse_mode="Markdown"
-        )
+        try:
+            await query.edit_message_text(
+                text=message,
+                reply_markup=create_main_keyboard(),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            # Ignore "message is not modified" error
+            if "message is not modified" not in str(e).lower():
+                raise
 
     elif data == "interval_menu":
         current_interval = s.get('interval', 60)
@@ -290,22 +300,30 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Current interval: {format_interval(current_interval)}\n\n"
             f"Choose a preset interval:"
         )
-        await query.edit_message_text(
-            text=message,
-            reply_markup=create_interval_keyboard(),
-            parse_mode="Markdown"
-        )
+        try:
+            await query.edit_message_text(
+                text=message,
+                reply_markup=create_interval_keyboard(),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                raise
 
     elif data == "quick_intervals":
         message = (
             "⚡ *Quick Interval Settings*\n\n"
             "Choose from common intervals or use custom settings:"
         )
-        await query.edit_message_text(
-            text=message,
-            reply_markup=create_interval_keyboard(),
-            parse_mode="Markdown"
-        )
+        try:
+            await query.edit_message_text(
+                text=message,
+                reply_markup=create_interval_keyboard(),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                raise
 
     elif data.startswith("set_interval_"):
         # Extract interval from callback data
@@ -317,31 +335,43 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ *Interval Updated*\n\n"
             f"Check interval set to {format_interval(interval)}"
         )
-        await query.edit_message_text(
-            text=message,
-            reply_markup=create_main_keyboard(),
-            parse_mode="Markdown"
-        )
+        try:
+            await query.edit_message_text(
+                text=message,
+                reply_markup=create_main_keyboard(),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                raise
 
     elif data == "refresh":
         # Just refresh current status
         message = format_status_message(s)
-        await query.edit_message_text(
-            text=message,
-            reply_markup=create_main_keyboard(),
-            parse_mode="Markdown"
-        )
+        try:
+            await query.edit_message_text(
+                text=message,
+                reply_markup=create_main_keyboard(),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                raise
 
     elif data == "back_main":
         message = (
             "🤖 *Parking Monitor Bot*\n\n"
             "What would you like to do?"
         )
-        await query.edit_message_text(
-            text=message,
-            reply_markup=create_main_keyboard(),
-            parse_mode="Markdown"
-        )
+        try:
+            await query.edit_message_text(
+                text=message,
+                reply_markup=create_main_keyboard(),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                raise
 
 # ---------- Background alert task ----------
 
@@ -370,13 +400,15 @@ async def alert_loop(app: Application):
 
             s["alert"] = False
             save_state(s)
+        if s.get("error"):
+            await app.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=f"❌ Error: {s['error']}"
+            )
+            s["error"] = None
+            save_state(s)
 
         await asyncio.sleep(5)
-
-# ---------- App startup hook ----------
-
-async def on_startup(app: Application):
-    app.create_task(alert_loop(app))
 
 # ---------- Main ----------
 
@@ -392,9 +424,18 @@ def main():
     # Callback query handler for inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    app.post_init = on_startup  # <-- IMPORTANT
+    # Create and run alert task in background
+    async def run_with_alerts():
+        async with app:
+            # Start the alert task
+            task = asyncio.create_task(alert_loop(app))
+            # Start the bot
+            await app.start()
+            # Wait for the bot to stop (this will never happen in normal operation)
+            await task
 
-    app.run_polling()
+    # Run the application
+    asyncio.run(run_with_alerts())
 
 if __name__ == "__main__":
     main()
