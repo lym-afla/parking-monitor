@@ -375,40 +375,59 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Background alert task ----------
 
-async def alert_loop(app: Application):
-    while True:
-        s = load_state()
-        if s.get("alert"):
-            # Send alert with inline keyboard
-            alert_keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("📊 Check Status", callback_data="status"),
-                    InlineKeyboardButton("📈 View Stats", callback_data="stats"),
-                ]
-            ])
+def start_alert_task(application: Application):
+    """Start the alert task in a separate thread"""
+    import threading
 
-            await app.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=(
-                    "🚨 *PARKING AVAILABLE!*\n\n"
-                    "A parking spot has become available!\n"
-                    "Click below to check current status:"
-                ),
-                reply_markup=alert_keyboard,
-                parse_mode="Markdown"
-            )
+    def alert_worker():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-            s["alert"] = False
-            save_state(s)
-        if s.get("error"):
-            await app.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=f"❌ Error: {s['error']}"
-            )
-            s["error"] = None
-            save_state(s)
+        async def run_alerts():
+            while True:
+                try:
+                    s = load_state()
+                    if s.get("alert"):
+                        # Send alert with inline keyboard
+                        alert_keyboard = InlineKeyboardMarkup([
+                            [
+                                InlineKeyboardButton("📊 Check Status", callback_data="status"),
+                                InlineKeyboardButton("📈 View Stats", callback_data="stats"),
+                            ]
+                        ])
 
-        await asyncio.sleep(5)
+                        await application.bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=(
+                                "🚨 *PARKING AVAILABLE!*\n\n"
+                                "A parking spot has become available!\n"
+                                "Click below to check current status:"
+                            ),
+                            reply_markup=alert_keyboard,
+                            parse_mode="Markdown"
+                        )
+
+                        s["alert"] = False
+                        save_state(s)
+                    if s.get("error"):
+                        await application.bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=f"❌ Error: {s['error']}"
+                        )
+                        s["error"] = None
+                        save_state(s)
+
+                    await asyncio.sleep(5)
+                except Exception as e:
+                    print(f"Alert task error: {e}")
+                    await asyncio.sleep(5)
+
+        loop.run_until_complete(run_alerts())
+
+    # Start the alert worker thread
+    alert_thread = threading.Thread(target=alert_worker, daemon=True)
+    alert_thread.start()
+    return alert_thread
 
 # ---------- Main ----------
 
@@ -427,20 +446,15 @@ def main():
     # Callback query handler for inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    # Create and run alert task in background
-    async def run_with_alerts():
-        async with app:
-            # Start the alert task
-            task = asyncio.create_task(alert_loop(app))
-            # Start the bot
-            await app.start()
-            # Wait for the bot to stop (this will never happen in normal operation)
-            await task
+    # Start the alert task in background
+    print("Starting alert task...")
+    start_alert_task(app)
 
     # Run the application
     try:
         print("Running bot application...")
-        asyncio.run(run_with_alerts())
+        # Run the bot with polling - this will handle updates continuously
+        app.run_polling(drop_pending_updates=True)
     except Exception as e:
         print(f"Bot error: {e}")
         import traceback
