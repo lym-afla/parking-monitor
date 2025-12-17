@@ -149,26 +149,41 @@ health_check() {
         echo "⚠️  State file not found (will be created on first run)"
     fi
 
-    # Check environment configuration
+    # Check configuration
     echo -e "${CYAN}⚙️  Configuration:${NC}"
-    if [ -f "$APP_PATH/.env" ]; then
-        echo "✅ Environment file exists"
+    if [ -f "$APP_PATH/config.py" ]; then
+        echo "✅ Configuration file exists (config.py)"
 
-        # Check for required tokens
-        if grep -q "TELEGRAM_BOT_TOKEN" "$APP_PATH/.env"; then
-            echo "✅ Telegram bot token configured"
-        else
-            echo "❌ Telegram bot token missing"
-            issues=$((issues + 1))
-        fi
+        # Check for required configuration using Python
+        if [ -d "$VENV_PATH" ]; then
+            if $VENV_PATH/bin/python -c "
+import sys
+sys.path.append('$APP_PATH')
+try:
+    import config
+    required_vars = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
+    missing_vars = []
+    for var in required_vars:
+        if not hasattr(config, var) or getattr(config, var) == '' or getattr(config, var).startswith('YOUR_'):
+            missing_vars.append(var)
 
-        if grep -q "TELEGRAM_AUTHORIZED_USER_IDS" "$APP_PATH/.env"; then
-            echo "✅ Authorized users configured"
-        else
-            echo "⚠️  Authorized users not configured"
+    if missing_vars:
+        print(f'⚠️  Missing or unconfigured variables: {\", \".join(missing_vars)}')
+        exit(1)
+    else:
+        print('✅ All required configuration variables present')
+except Exception as e:
+    print(f'❌ Configuration error: {e}')
+    exit(1)
+" 2>/dev/null; then
+                echo "✅ Configuration is valid"
+            else
+                echo "⚠️  Configuration needs attention"
+                issues=$((issues + 1))
+            fi
         fi
     else
-        echo "❌ Environment file missing"
+        echo "❌ Configuration file missing"
         issues=$((issues + 1))
     fi
 

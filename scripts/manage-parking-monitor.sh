@@ -644,26 +644,33 @@ except Exception as e:
         echo "     Start with: sudo parking-monitor start"
     fi
 
-    # Test 5: Environment file
+    # Test 5: Configuration file
     echo
-    print_status "Test 5: Environment Configuration"
-    if [ -f "$APP_DIR/.env" ]; then
-        echo "  ✅ Environment file exists"
+    print_status "Test 5: Configuration"
+    if [ -f "$APP_DIR/config.py" ]; then
+        echo "  ✅ Configuration file exists (config.py)"
 
-        # Check for required variables
-        local missing_vars=()
+        # Check for required configuration variables
+        if [ -d "$VENV_DIR" ]; then
+            source "$VENV_DIR/bin/activate"
+            cd "$APP_DIR"
+            $VENV_DIR/bin/python -c "
+import config
+required_vars = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
+missing_vars = []
+for var in required_vars:
+    if not hasattr(config, var) or getattr(config, var) == '' or getattr(config, var).startswith('YOUR_'):
+        missing_vars.append(var)
 
-        grep -q "TELEGRAM_BOT_TOKEN" "$APP_DIR/.env" || missing_vars+=("TELEGRAM_BOT_TOKEN")
-        grep -q "TELEGRAM_AUTHORIZED_USER_IDS" "$APP_DIR/.env" || missing_vars+=("TELEGRAM_AUTHORIZED_USER_IDS")
-
-        if [ ${#missing_vars[@]} -eq 0 ]; then
-            echo "  ✅ All required variables configured"
-        else
-            echo "  ⚠️  Missing variables: ${missing_vars[*]}"
-            all_tests_passed=false
+if missing_vars:
+    print(f'  ⚠️  Missing or unconfigured variables: {\", \".join(missing_vars)}')
+    exit(1)
+else:
+    print('  ✅ All required configuration variables present')
+" || all_tests_passed=false
         fi
     else
-        echo "  ❌ Environment file not found at $APP_DIR/.env"
+        echo "  ❌ Configuration file not found at $APP_DIR/config.py"
         all_tests_passed=false
     fi
 
@@ -672,12 +679,22 @@ except Exception as e:
     print_status "Test 6: Log Files"
     if [ -d "$LOG_DIR" ]; then
         echo "  ✅ Log directory exists: $LOG_DIR"
-        if [ -f "$LOG_DIR/parking.log" ]; then
-            echo "  ✅ Log file exists"
-            echo "  Last 3 lines:"
-            tail -n 3 "$LOG_DIR/parking.log" | sed 's/^/     /'
+        if [ -f "$LOG_DIR/monitor.log" ] && [ -f "$LOG_DIR/bot.log" ]; then
+            echo "  ✅ Both log files exist (monitor.log, bot.log)"
+            echo "  Last 3 lines of monitor.log:"
+            tail -n 3 "$LOG_DIR/monitor.log" | sed 's/^/     /'
+            echo "  Last 3 lines of bot.log:"
+            tail -n 3 "$LOG_DIR/bot.log" | sed 's/^/     /'
+        elif [ -f "$LOG_DIR/monitor.log" ] || [ -f "$LOG_DIR/bot.log" ]; then
+            echo "  ⚠️  Partial log files found (normal if only one service has started)"
+            if [ -f "$LOG_DIR/monitor.log" ]; then
+                echo "    - monitor.log exists"
+            fi
+            if [ -f "$LOG_DIR/bot.log" ]; then
+                echo "    - bot.log exists"
+            fi
         else
-            echo "  ⚠️  Log file not yet created (normal if service hasn't started)"
+            echo "  ⚠️  Log files not yet created (normal if services haven't started)"
         fi
     else
         echo "  ❌ Log directory not found"
@@ -719,7 +736,7 @@ except Exception as e:
         echo
         print_status "Common fixes:"
         echo "  - Missing venv: Run setup-service.sh"
-        echo "  - Missing .env: Copy from template and configure"
+        echo "  - Missing config: Copy config.py.example and configure"
         echo "  - Service not set up: Run setup-service.sh"
         echo "  - Wrong permissions: sudo chown -R $APP_USER:$APP_USER $APP_DIR"
     fi
