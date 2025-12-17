@@ -1,0 +1,33 @@
+[Unit]
+Description=Parking Monitor - Web Scraper
+After=network.target
+PartOf=parking-service.service
+
+[Service]
+Type=simple
+User=parking_user
+Group=parking_user
+WorkingDirectory=/opt/parking_monitor
+Environment=PATH=/opt/parking_monitor/venv/bin
+ExecStart=/opt/parking_monitor/venv/bin/python /opt/parking_monitor/monitor.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/opt/parking_monitor/logs/monitor.log
+StandardError=append:/opt/parking_monitor/logs/monitor.log
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/parking_monitor
+ReadWritePaths=/opt/parking_monitor/logs
+ReadWritePaths=/opt/parking_monitor/config
+ReadWritePaths=/home/parking_user/.cache/ms-playwright
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
