@@ -69,12 +69,15 @@ def main():
     log("=== Parking Monitor Service Started ===")
     log(f"State file: {STATE_FILE}")
     log(f"Target: {TARGET_ADDRESS_TEXT}, {TARGET_REGION_TEXT}")
-    
-    state = load_state()
-    log(f"Loaded state: checks={state.get('checks', 0)}, hits={state.get('hits', 0)}, interval={state.get('interval', CHECK_INTERVAL_SECONDS)}s")
+
+    initial_state = load_state()
+    log(f"Loaded state: checks={initial_state.get('checks', 0)}, hits={initial_state.get('hits', 0)}, interval={initial_state.get('interval', CHECK_INTERVAL_SECONDS)}s")
 
     while True:
         try:
+            # Reload state to pick up interval changes from Telegram bot
+            state = load_state()
+
             enabled = check_site()
             state["checks"] += 1
             state["last_check"] = datetime.now().isoformat()
@@ -87,7 +90,7 @@ def main():
             state["last_enabled"] = enabled
             state["error"] = None
             save_state(state)
-            
+
             interval = state.get("interval", CHECK_INTERVAL_SECONDS)
             log(f"Check #{state['checks']} complete. Next check in {interval} seconds.")
 
@@ -95,10 +98,13 @@ def main():
             log(f"ERROR: {str(e)}")
             import traceback
             traceback.print_exc()
+            # Reload state to ensure we don't overwrite interval changes
+            state = load_state()
             state["error"] = str(e)
             save_state(state)
+            interval = state.get("interval", CHECK_INTERVAL_SECONDS)
 
-        time.sleep(state.get("interval", CHECK_INTERVAL_SECONDS))
+        time.sleep(interval)
 
 if __name__ == "__main__":
     main()
