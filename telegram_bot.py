@@ -413,6 +413,9 @@ async def alert_loop(app: Application):
 # ---------- Main ----------
 
 def main():
+    print("Starting Telegram bot...")
+    print(f"Bot token: {TELEGRAM_BOT_TOKEN[:20]}...")
+    print(f"Chat ID: {TELEGRAM_CHAT_ID}")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Command handlers
@@ -435,7 +438,13 @@ def main():
             await task
 
     # Run the application
-    asyncio.run(run_with_alerts())
+    try:
+        print("Running bot application...")
+        asyncio.run(run_with_alerts())
+    except Exception as e:
+        print(f"Bot error: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
