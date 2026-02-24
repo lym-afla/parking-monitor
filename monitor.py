@@ -73,8 +73,14 @@ def main():
     initial_state = load_state()
     log(f"Loaded state: checks={initial_state.get('checks', 0)}, hits={initial_state.get('hits', 0)}, interval={initial_state.get('interval', CHECK_INTERVAL_SECONDS)}s")
 
+    initial_state = load_state()
+    log(f"Loaded state: checks={initial_state.get('checks', 0)}, hits={initial_state.get('hits', 0)}, interval={initial_state.get('interval', CHECK_INTERVAL_SECONDS)}s")
+
     while True:
         try:
+            # Reload state to pick up interval changes from Telegram bot
+            state = load_state()
+
             # Reload state to pick up interval changes from Telegram bot
             state = load_state()
 
@@ -91,6 +97,7 @@ def main():
             state["error"] = None
             save_state(state)
 
+
             interval = state.get("interval", CHECK_INTERVAL_SECONDS)
             log(f"Check #{state['checks']} complete. Next check in {interval} seconds.")
 
@@ -100,10 +107,14 @@ def main():
             traceback.print_exc()
             # Reload state to ensure we don't overwrite interval changes
             state = load_state()
+            # Reload state to ensure we don't overwrite interval changes
+            state = load_state()
             state["error"] = str(e)
             save_state(state)
             interval = state.get("interval", CHECK_INTERVAL_SECONDS)
+            interval = state.get("interval", CHECK_INTERVAL_SECONDS)
 
+        time.sleep(interval)
         time.sleep(interval)
 
 if __name__ == "__main__":
