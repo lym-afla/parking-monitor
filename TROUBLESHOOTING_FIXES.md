@@ -13,36 +13,76 @@ The parking monitor services were failing when run as systemd services, despite 
 
 ### 2. Log File Permission Issues
 - Log files were owned by root instead of parking_user
-- Service could not write logs even though it was running
+- Service couldn't write logs even though it was running
 
 ### 3. Systemd Security Settings Too Restrictive
-- ProtectSystem=strict prevented Chromium from accessing /usr and system libraries
-- ProtectHome=true blocked access to home directories
-- PrivateDevices=true prevented access to devices needed by the browser
+-  prevented Chromium from accessing /usr and system libraries
+-  blocked access to home directories
+-  prevented access to devices needed by the browser
 - These settings blocked Chromium from launching, even though the executable existed
 
 ## Solutions Applied
 
 ### 1. Killed Manual Processes
-Identified and killed all manually-run Python processes
+
 
 ### 2. Fixed Log Permissions
-sudo chown parking_user:parking_user /opt/parking_monitor/logs/*.log
+
 
 ### 3. Relaxed Systemd Security Settings
-Modified /etc/systemd/system/parking-service-monitor.service
+Modified :
+
+**Before (Restrictive):**
+
+
+**After (Balanced):**
+
 
 The key changes:
-- Removed ProtectSystem=strict - allows Chromium to access system libraries
-- Removed ProtectHome=true - allows access to home directories
-- Removed PrivateDevices=true - allows browser to access required devices
-- Kept NoNewPrivileges and PrivateTmp for basic security
+- Removed  - allows Chromium to access system libraries
+- Removed  - allows access to home directories
+- Removed  - allows browser to access required devices
+- Kept  and  for basic security
 
 ### 4. Added Logging to monitor.py
-Added comprehensive logging throughout the monitor script to track service startup, browser launch, website navigation steps, check results, and errors with full tracebacks.
+Added comprehensive logging throughout the monitor script to track:
+- Service startup
+- Browser launch
+- Website navigation steps
+- Check results
+- Errors with full tracebacks
+
+## Verification
+
+After fixes, both services are running correctly:
+
+
+
+State file updates correctly:
+
+
+## Key Lessons
+
+1. **Playwright/Chromium + Systemd Security**: Browser automation requires access to system resources. Strict systemd sandboxing prevents browsers from launching.
+
+2. **Manual Testing vs Service Testing**: Always test as the service user AND under systemd constraints. Manual tests as the service user may succeed while systemd services fail.
+
+3. **Process Management**: Ensure only one instance of each service runs at a time. Multiple instances cause state conflicts.
+
+4. **Logging is Essential**: Without proper logging, debugging service issues is nearly impossible.
+
+## Recommended Service Configuration
+
+For Playwright/browser automation services, use minimal security restrictions:
+
+
+
+## Monitoring Commands
+
+
 
 ## Date Fixed
 2025-12-17
 
 ## Status
-RESOLVED - Both services running successfully as systemd services
+✅ RESOLVED - Both services running successfully as systemd services
