@@ -281,24 +281,9 @@ class TelegramHandlers:
                 raise
 
 
-async def prepare_telegram_application(application: Application) -> None:
-    """Discard stale webhook updates before long polling starts."""
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-    except Exception as exc:
-        LOGGER.error("Telegram webhook reset failed: %s", type(exc).__name__)
-        raise
-    LOGGER.info("Telegram webhook reset completed")
-
-
 def build_application(config: RuntimeConfig, command_service: CommandService) -> Application:
     handlers = TelegramHandlers(command_service, config)
-    application = (
-        Application.builder()
-        .token(config.telegram_bot_token)
-        .post_init(prepare_telegram_application)
-        .build()
-    )
+    application = Application.builder().token(config.telegram_bot_token).build()
     application.add_handler(CommandHandler("start", handlers.start))
     application.add_handler(CommandHandler("status", handlers.status))
     application.add_handler(CommandHandler("stats", handlers.stats))
@@ -309,6 +294,9 @@ def build_application(config: RuntimeConfig, command_service: CommandService) ->
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("telegram.request").setLevel(logging.WARNING)
     config = load_config()
     store = NotificationStore(
         DATABASE_PATH,
@@ -317,7 +305,7 @@ def main() -> None:
     command_service = CommandService(STATE_FILE, health_provider=store.health_summary)
     application = build_application(config, command_service)
     LOGGER.info("Telegram polling starting")
-    application.run_polling()
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

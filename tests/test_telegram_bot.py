@@ -1,10 +1,11 @@
+import logging
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from command_service import ChannelHealth, StatsSnapshot, StatusSnapshot
 from config import RuntimeConfig
-from telegram_bot import TelegramHandlers, is_authorized, prepare_telegram_application
+from telegram_bot import TelegramHandlers, build_application, is_authorized, main
 
 
 AUTHORIZED_USER_ID = 404346140
@@ -13,7 +14,7 @@ AUTHORIZED_CHAT_ID = 404346140
 
 def runtime_config():
     return RuntimeConfig(
-        telegram_bot_token="test-token",
+        telegram_bot_token="123456:test-token",
         telegram_chat_id=AUTHORIZED_CHAT_ID,
         telegram_authorized_user_id=AUTHORIZED_USER_ID,
         discord_bot_token="test-discord-token",
@@ -145,13 +146,52 @@ class TelegramAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         update.message.reply_text.assert_not_awaited()
 
 
-class TelegramStartupTests(unittest.IsolatedAsyncioTestCase):
-    async def test_startup_deletes_stale_webhook_before_polling(self):
-        app = SimpleNamespace(bot=SimpleNamespace(delete_webhook=AsyncMock()))
+class TelegramStartupTests(unittest.TestCase):
+    def _run_main_with(self, application):
+        with (
+            patch("telegram_bot.load_config", return_value=runtime_config()),
+            patch("telegram_bot.NotificationStore") as store_type,
+            patch("telegram_bot.CommandService"),
+            patch("telegram_bot.build_application", return_value=application),
+        ):
+            store_type.return_value.health_summary = MagicMock()
+            main()
 
-        await prepare_telegram_application(app)
+    def test_startup_uses_only_polling_bootstrap_to_delete_stale_webhook(self):
+        built_application = build_application(runtime_config(), MagicMock())
+        self.assertIsNone(built_application.post_init)
 
-        app.bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=True)
+        application = SimpleNamespace(
+            bot=SimpleNamespace(delete_webhook=AsyncMock()),
+            run_polling=MagicMock(),
+        )
+        self._run_main_with(application)
+
+        application.run_polling.assert_called_once_with(drop_pending_updates=True)
+        application.bot.delete_webhook.assert_not_called()
+
+    def test_startup_suppresses_info_request_url_logging(self):
+        logger_names = (
+            "httpx",
+            "httpcore",
+            "telegram.request",
+            "telegram.request.HTTPXRequest",
+        )
+        loggers = [logging.getLogger(name) for name in logger_names]
+        previous_levels = [logger.level for logger in loggers]
+        previous_root_level = logging.getLogger().level
+        self.addCleanup(logging.getLogger().setLevel, previous_root_level)
+        for logger, previous_level in zip(loggers, previous_levels):
+            self.addCleanup(logger.setLevel, previous_level)
+            logger.setLevel(logging.NOTSET)
+        logging.getLogger().setLevel(logging.INFO)
+
+        application = SimpleNamespace(run_polling=MagicMock())
+        self._run_main_with(application)
+
+        for logger in loggers:
+            with self.subTest(logger=logger.name):
+                self.assertFalse(logger.isEnabledFor(logging.INFO))
 
 
 if __name__ == "__main__":
