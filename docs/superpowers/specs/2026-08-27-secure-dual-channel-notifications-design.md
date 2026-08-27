@@ -2,11 +2,11 @@
 
 ## Objective
 
-Make parking availability notifications resilient to a Telegram outage while
-containing the credential exposure discovered on 27 August 2026. Telegram and
-Discord must deliver independently, Telegram commands must be private to the
-single authorized user, and no live credential may exist in tracked source or
-application logs.
+Make parking availability notifications and remote control resilient to a
+Telegram outage while containing the credential exposure discovered on 27
+August 2026. Telegram and Discord must deliver independently, both command
+interfaces must be private to the single authorized user, and no live
+credential may exist in tracked source or application logs.
 
 ## Scope
 
@@ -14,10 +14,14 @@ This change covers:
 
 - environment-only Telegram and Discord credentials;
 - strict Telegram authorization for user/chat `404346140`;
+- a guild-scoped Discord bot restricted to application `1542514080810664018`,
+  server `1476852384826392628`, channel `1542511880659017792`, and user
+  `1138419941926776893`;
+- Discord slash commands and interactive alert controls mirroring Telegram;
 - independent Telegram and Discord availability delivery;
 - durable per-event and per-channel delivery state;
-- bounded retries and sanitized delivery auditing;
-- channel health in the Telegram `/status` response;
+- bounded retry backoff and sanitized delivery auditing;
+- channel health in both `/status` responses;
 - secure interactive secret installation on the production server; and
 - tests and production verification for both channels.
 
@@ -37,22 +41,29 @@ credential literals:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `TELEGRAM_AUTHORIZED_USER_ID`
-- `DISCORD_WEBHOOK_URL`
+- `DISCORD_BOT_TOKEN`
+- `DISCORD_APPLICATION_ID`
+- `DISCORD_GUILD_ID`
+- `DISCORD_CHANNEL_ID`
+- `DISCORD_AUTHORIZED_USER_ID`
 
 Production secrets will be stored in `/etc/parking-monitor.env`, owned by
-`root:root` with mode `0600`. Both relevant systemd services may read the file
+`root:root` with mode `0600`. The relevant systemd services may read the file
 through `EnvironmentFile`; the file itself remains unreadable to the service
 account. Logs, exceptions, status responses, and audit records must not contain
 tokens, webhook URLs, or URL query strings.
 
-An interactive root-only script will prompt without echo, validate the shape
-of each value, write a temporary file with restrictive permissions, and
-atomically replace `/etc/parking-monitor.env`. It will never accept secrets as
-command-line arguments.
+An interactive root-only script will prompt without echo for the Telegram and
+Discord bot tokens, validate the shape of all values, write a temporary file
+with restrictive permissions, and atomically replace
+`/etc/parking-monitor.env`. It will never accept secrets as command-line
+arguments. The non-secret Discord identifiers above are written by the script
+from reviewed defaults and may be overridden interactively.
 
 The old revoked Telegram token can remain in historical commits but will be
-removed from the current tracked tree. The regenerated Discord webhook must
-never be pasted into chat or committed.
+removed from the current tracked tree. The regenerated Discord webhook is not
+used by this design. The Discord bot token must never be pasted into chat or
+committed.
 
 ### Telegram authorization
 
@@ -86,7 +97,10 @@ settings are changed.
 4. The Telegram application continues serving authorized commands and callback
    buttons. Its `/status` response reads monitoring state plus notification
    health.
-5. Channel adapters expose one delivery interface and return a structured,
+5. A Discord bot serves guild-scoped slash commands and interactive alert
+   controls through the Gateway. Both command front ends call the same shared
+   status, statistics, and interval operations.
+6. Channel adapters expose one delivery interface and return a structured,
    sanitized result. They never decide event lifecycle or retry policy.
 
 ### SQLite schema
@@ -111,10 +125,10 @@ The database lives at `/opt/parking_monitor/notifications.sqlite3` and contains:
 - `delivered_at`; and
 - `last_error`: sanitized class/category and bounded message.
 
-Each new event creates one delivery row for every configured channel. A channel
-is considered configured only when its credential is present and valid in
-shape. Missing optional Discord configuration is logged as disabled, not as a
-delivery failure.
+Each new event creates one delivery row for Telegram and one for Discord. A
+channel is considered configured only when its credential and destination are
+present and valid in shape. Missing configuration is logged as disabled, not
+as a delivery failure.
 
 ### Delivery lifecycle
 
@@ -138,16 +152,45 @@ complete while only the failed channel retries.
 
 ### Discord
 
-Discord is outbound-only. The adapter posts a concise parking-available
-message to the configured webhook and treats an HTTP 2xx response as success.
-It does not read Discord messages or implement commands. The webhook URL is
-redacted from every error before logging or persistence.
+The Discord bot uses guild installation and registers guild-scoped slash
+commands so updates appear immediately and are unavailable outside the private
+server. It does not request Message Content, Guild Members, Presence, or other
+privileged Gateway intents.
+
+Every interaction must match all three runtime boundaries before any state is
+read or changed:
+
+- guild ID `1476852384826392628`;
+- channel ID `1542511880659017792`; and
+- user ID `1138419941926776893`.
+
+Unauthorized interactions receive an ephemeral denial and create a sanitized
+security log. Commands are also configured with restrictive default Discord
+permissions, but runtime ID validation is authoritative because server
+administrators can bypass Discord command visibility restrictions.
+
+Discord mirrors these Telegram operations:
+
+- `/status`: last parking check, availability, polling mode/interval, next
+  expected check, and delivery-channel health;
+- `/stats`: total checks, availability hits, last check, and notification
+  delivery counts; and
+- `/interval`: view or change the normal polling interval while leaving the
+  five-minute month-end override intact.
+
+Availability alerts are posted to the configured parking channel using the bot
+token and include interactive Status and Stats buttons. Button interactions use
+the same authorization and shared operations as slash commands. The Discord
+bot token and authorization headers are redacted from every error before
+logging or persistence.
 
 ### Telegram
 
 Telegram sends the existing availability message and inline status buttons to
 the configured private chat. Command handlers and callback handlers share one
-authorization function. `/status` includes:
+authorization function. Its `/status`, `/stats`, and `/interval` behavior is
+moved behind the same shared operations used by Discord so both interfaces
+report and mutate the same state consistently. `/status` includes:
 
 - last parking check and availability;
 - active polling interval/mode;
@@ -170,8 +213,7 @@ adaptive schedule are preserved.
 
 Application logs include event ID, channel, attempt number, result, next retry,
 and sanitized error category. They exclude request authorization headers,
-Telegram tokens, Discord webhook paths, payload credentials, and environment
-values.
+Telegram and Discord bot tokens, payload credentials, and environment values.
 
 The notifier emits a periodic health summary and an immediate log when a
 channel changes between healthy, retrying, failed, disabled, and recovered.
@@ -181,17 +223,22 @@ The systemd services retain restart-on-failure behavior.
 
 Automated tests will cover:
 
-- missing required environment configuration and optional Discord disabling;
+- missing or malformed required environment configuration;
 - rejection of unauthorized Telegram commands and callbacks before state
   access;
 - authorization of the single configured user/chat;
+- Discord guild, channel, and user authorization before state access;
+- guild-scoped registration and handling of `/status`, `/stats`, and
+  `/interval`;
+- shared command results across Telegram and Discord;
+- Discord status/stats alert-button authorization;
 - webhook deletion before polling;
 - creation of one event with one row per configured channel;
 - independent channel success and failure;
 - no redelivery of a successful channel;
 - retry schedule and persistence across process restart;
 - permanent authentication failure classification;
-- token and webhook redaction from logs and stored errors;
+- Telegram and Discord bot-token redaction from logs and stored errors;
 - legacy `alert` migration; and
 - existing adaptive polling tests.
 
@@ -203,16 +250,18 @@ SQLite databases for event and retry behavior.
 1. Run the full test suite locally.
 2. Commit and push code without credentials.
 3. Pull the tested revision on `cloudru-server`.
-4. Install/update systemd units and the root-only environment-file reference.
+4. Install/update systemd units for the notifier, Telegram bot, Discord bot,
+   and the root-only environment-file reference.
 5. Have the user run the interactive secret installer directly in an SSH
-   terminal and enter the replacement Telegram token and regenerated Discord
-   webhook URL without echo.
+   terminal and enter the replacement Telegram and Discord bot tokens without
+   echo.
 6. Disable Telegram group addition through BotFather and restore the desired
    bot profile.
-7. Restart the notifier/bot service, then the monitor only if its event-writing
-   code changed.
-8. Verify webhook deletion, authorized Telegram `/status`, unauthorized-access
-   rejection in an automated handler test, and active service health.
+7. Restart the notifier, Telegram bot, and Discord bot services, then the
+   monitor only if its event-writing code changed.
+8. Verify webhook deletion, authorized Telegram `/status`, Discord guild command
+   registration, authorized Discord `/status`, automated unauthorized-access
+   rejection for both interfaces, and active service health.
 9. Create an explicit test notification event and confirm one successful audit
    row for Telegram and one for Discord. The test event must be clearly labeled
    and must not alter parking availability statistics.
