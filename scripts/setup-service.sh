@@ -118,12 +118,20 @@ setup_permissions() {
     mkdir -p "$LOG_DIR"
     mkdir -p "$CONFIG_DIR"
 
-    # Own only runtime boundaries and their existing runtime files. Never
-    # recurse through the repository or virtual environment: doing so destroys
-    # executable modes in venv/bin and Playwright's installed helpers.
+    # Own only runtime boundaries and their existing runtime files. Adopt the
+    # Git metadata and an existing virtual environment so all future Git/pip
+    # operations can run as the service account. Chown preserves executable
+    # modes; never chmod virtual-environment internals.
     chown "$APP_USER:$APP_USER" "$APP_DIR" "$LOG_DIR" "$CONFIG_DIR"
     chmod 0755 "$APP_DIR" "$LOG_DIR"
     chmod 0700 "$CONFIG_DIR"
+
+    if [ -e "$APP_DIR/.git" ]; then
+        chown -R "$APP_USER:$APP_USER" "$APP_DIR/.git"
+    fi
+    if [ -d "$VENV_DIR" ]; then
+        chown -R "$APP_USER:$APP_USER" "$VENV_DIR"
+    fi
 
     local runtime_path
     for runtime_path in \

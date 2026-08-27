@@ -76,20 +76,73 @@ Do this before changing the checkout. Keep the output in the deployment record:
 ```bash
 ssh cloudru-server
 cd /opt/parking_monitor
+set -euo pipefail
 
-PREVIOUS_REVISION=$(git rev-parse HEAD)
+PREVIOUS_REVISION=$(sudo -u parking_user git rev-parse HEAD)
 printf 'previous revision: %s\n' "$PREVIOUS_REVISION"
 UNIT_BACKUP="/var/backups/parking-monitor-units-$(date -u +%Y%m%dT%H%M%SZ)"
 sudo install -d -m 700 "$UNIT_BACKUP"
-sudo cp -a /etc/systemd/system/parking-service.service "$UNIT_BACKUP"/ 2>/dev/null || true
-sudo cp -a /etc/systemd/system/parking-service-*.service "$UNIT_BACKUP"/ 2>/dev/null || true
+sudo install -m 600 /dev/null "$UNIT_BACKUP/unit-files.txt"
+sudo install -m 600 /dev/null "$UNIT_BACKUP/enablement.txt"
+
+backup_unit() {
+  local requirement=$1
+  local source_path=$2
+  local unit_name=${source_path##*/}
+  if sudo test -e "$source_path"; then
+    sudo test -s "$source_path"
+    sudo test -r "$source_path"
+    sudo cp -a -- "$source_path" "$UNIT_BACKUP/$unit_name"
+    sudo test -s "$UNIT_BACKUP/$unit_name"
+    sudo test -r "$UNIT_BACKUP/$unit_name"
+    printf 'present %s\n' "$unit_name" | \
+      sudo tee -a "$UNIT_BACKUP/unit-files.txt" >/dev/null
+  elif [ "$requirement" = mandatory ]; then
+    printf 'mandatory unit is missing: %s\n' "$source_path" >&2
+    return 1
+  else
+    printf 'absent %s\n' "$unit_name" | \
+      sudo tee -a "$UNIT_BACKUP/unit-files.txt" >/dev/null
+  fi
+}
+
+backup_unit mandatory /etc/systemd/system/parking-service-monitor.service
+backup_unit mandatory /etc/systemd/system/parking-service-bot.service
+backup_unit optional /etc/systemd/system/parking-service.service
+backup_unit optional /etc/systemd/system/parking-service-notifier.service
+backup_unit optional /etc/systemd/system/parking-service-discord.service
+
 for unit in \
   parking-service.service parking-service-monitor parking-service-notifier \
   parking-service-bot parking-service-discord
 do
-  state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+  if state=$(systemctl is-enabled "$unit" 2>/dev/null); then
+    :
+  else
+    state=${state:-not-found}
+  fi
   printf '%s %s\n' "$unit" "${state:-not-found}" | \
     sudo tee -a "$UNIT_BACKUP/enablement.txt" >/dev/null
+done
+
+sudo test -s "$UNIT_BACKUP/parking-service-monitor.service"
+sudo test -r "$UNIT_BACKUP/parking-service-monitor.service"
+sudo test -s "$UNIT_BACKUP/parking-service-bot.service"
+sudo test -r "$UNIT_BACKUP/parking-service-bot.service"
+sudo test -s "$UNIT_BACKUP/unit-files.txt"
+sudo test -r "$UNIT_BACKUP/unit-files.txt"
+sudo test -s "$UNIT_BACKUP/enablement.txt"
+sudo test -r "$UNIT_BACKUP/enablement.txt"
+test "$(sudo awk 'END {print NR}' "$UNIT_BACKUP/unit-files.txt")" -eq 5
+test "$(sudo awk 'END {print NR}' "$UNIT_BACKUP/enablement.txt")" -eq 5
+for expected_unit in \
+  parking-service.service parking-service-monitor.service \
+  parking-service-notifier.service parking-service-bot.service \
+  parking-service-discord.service
+do
+  test "$(sudo awk -v unit="$expected_unit" \
+    '$2 == unit {count += 1} END {print count + 0}' \
+    "$UNIT_BACKUP/unit-files.txt")" -eq 1
 done
 printf 'unit backup: %s\n' "$UNIT_BACKUP"
 sudo systemctl show \
@@ -101,7 +154,7 @@ sudo systemctl show \
 Also preserve monitoring counters for comparison without changing them:
 
 ```bash
-venv/bin/python - <<'PY'
+sudo -u parking_user venv/bin/python - <<'PY'
 import json
 from pathlib import Path
 
@@ -111,6 +164,15 @@ for name in ("checks", "hits", "last_enabled", "last_check"):
 PY
 ```
 
+Every command above is fail-closed. Do not install or remove any unit unless
+both mandatory units, the five-line presence manifest, and the five-line
+enablement record pass the non-empty/readable checks.
+
+A first-time full setup adopts `.git` and an existing `venv` for
+`parking_user` without changing virtual-environment modes. After that boundary
+is established, all Git and Python dependency operations run as
+`parking_user`; an existing host must not rerun full setup during upgrade.
+
 ## Deploy code without restarting
 
 Pull only a fast-forward update, install dependencies, and verify the checked
@@ -118,18 +180,20 @@ out code before installing units:
 
 ```bash
 cd /opt/parking_monitor
-git pull --ff-only
-venv/bin/pip install -r requirements.txt
-venv/bin/python -m playwright install chromium
-venv/bin/python -m unittest discover -v
-venv/bin/python -m py_compile \
+sudo -u parking_user git pull --ff-only
+sudo -u parking_user venv/bin/python -m pip install -r requirements.txt
+sudo -u parking_user venv/bin/python -m playwright install chromium
+sudo -u parking_user venv/bin/python -m unittest discover -v
+sudo -u parking_user venv/bin/python -m py_compile \
   config.py command_service.py notification_store.py notifier.py \
   telegram_bot.py discord_bot.py monitor.py
-sudo ./scripts/setup-service.sh
+sudo ./scripts/setup-service.sh --install-units
 ```
 
-`setup-service.sh` installs and enables four unit files and reloads systemd. It
-does not start services and does not create or overwrite
+The existing-host upgrade uses the tested `--install-units` path only after
+dependencies and code verification pass. It installs/enables the four unit
+files and reloads systemd without rerunning full setup. It does not start
+services and does not create or overwrite
 `/etc/parking-monitor.env`. Do not restart any service until local remote tests
 pass and the secret installation below validates.
 
@@ -215,7 +279,7 @@ sudo parking-monitor logs -t discord -n 100
 Read delivery metadata without selecting payloads or stored error text:
 
 ```bash
-venv/bin/python - <<'PY'
+sudo -u parking_user venv/bin/python - <<'PY'
 import sqlite3
 
 connection = sqlite3.connect("notifications.sqlite3")
@@ -284,7 +348,7 @@ application authentication errors are in the append files.
 Record the final revision and service timestamps:
 
 ```bash
-git rev-parse HEAD
+sudo -u parking_user git rev-parse HEAD
 sudo systemctl show \
   parking-service-monitor parking-service-notifier \
   parking-service-bot parking-service-discord \
@@ -312,6 +376,67 @@ statistics change unexpectedly. Preserve runtime data before changing Git:
 
 ```bash
 cd /opt/parking_monitor
+set -euo pipefail
+: "${PREVIOUS_REVISION:?set PREVIOUS_REVISION to the recorded revision}"
+: "${UNIT_BACKUP:?set UNIT_BACKUP to the recorded backup directory}"
+
+sudo test -s "$UNIT_BACKUP/parking-service-monitor.service"
+sudo test -r "$UNIT_BACKUP/parking-service-monitor.service"
+sudo test -s "$UNIT_BACKUP/parking-service-bot.service"
+sudo test -r "$UNIT_BACKUP/parking-service-bot.service"
+sudo test -s "$UNIT_BACKUP/unit-files.txt"
+sudo test -r "$UNIT_BACKUP/unit-files.txt"
+sudo test -s "$UNIT_BACKUP/enablement.txt"
+sudo test -r "$UNIT_BACKUP/enablement.txt"
+test "$(sudo awk 'END {print NR}' "$UNIT_BACKUP/unit-files.txt")" -eq 5
+test "$(sudo awk 'END {print NR}' "$UNIT_BACKUP/enablement.txt")" -eq 5
+for expected_unit in \
+  parking-service.service parking-service-monitor.service \
+  parking-service-notifier.service parking-service-bot.service \
+  parking-service-discord.service
+do
+  test "$(sudo awk -v unit="$expected_unit" \
+    '$2 == unit {count += 1} END {print count + 0}' \
+    "$UNIT_BACKUP/unit-files.txt")" -eq 1
+done
+for expected_unit in \
+  parking-service.service parking-service-monitor parking-service-notifier \
+  parking-service-bot parking-service-discord
+do
+  test "$(sudo awk -v unit="$expected_unit" \
+    '$1 == unit {count += 1} END {print count + 0}' \
+    "$UNIT_BACKUP/enablement.txt")" -eq 1
+done
+sudo grep -qx 'present parking-service-monitor.service' \
+  "$UNIT_BACKUP/unit-files.txt"
+sudo grep -qx 'present parking-service-bot.service' \
+  "$UNIT_BACKUP/unit-files.txt"
+while read -r presence unit_name; do
+  case "$unit_name" in
+    parking-service.service|parking-service-monitor.service|\
+    parking-service-notifier.service|parking-service-bot.service|\
+    parking-service-discord.service)
+      ;;
+    *)
+      printf 'invalid unit backup manifest entry: %s\n' "$unit_name" >&2
+      exit 1
+      ;;
+  esac
+  case "$presence" in
+    present)
+      sudo test -s "$UNIT_BACKUP/$unit_name"
+      sudo test -r "$UNIT_BACKUP/$unit_name"
+      ;;
+    absent)
+      sudo test ! -e "$UNIT_BACKUP/$unit_name"
+      ;;
+    *)
+      printf 'invalid unit backup state: %s\n' "$presence" >&2
+      exit 1
+      ;;
+  esac
+done < <(sudo cat "$UNIT_BACKUP/unit-files.txt")
+
 ROLLBACK_BACKUP="/var/backups/parking-monitor-$(date -u +%Y%m%dT%H%M%SZ)"
 sudo install -d -m 700 "$ROLLBACK_BACKUP"
 sudo cp -a state.json notifications.sqlite3 "$ROLLBACK_BACKUP"/
@@ -319,15 +444,19 @@ for file in notifications.sqlite3-wal notifications.sqlite3-shm; do
   if [ -e "$file" ]; then sudo cp -a "$file" "$ROLLBACK_BACKUP"/; fi
 done
 sudo systemctl disable --now parking-service-notifier parking-service-discord
-git switch --detach "$PREVIOUS_REVISION"
+sudo -u parking_user git switch --detach "$PREVIOUS_REVISION"
 sudo rm -f \
   /etc/systemd/system/parking-service.service \
   /etc/systemd/system/parking-service-monitor.service \
   /etc/systemd/system/parking-service-notifier.service \
   /etc/systemd/system/parking-service-bot.service \
   /etc/systemd/system/parking-service-discord.service
-sudo find "$UNIT_BACKUP" -maxdepth 1 -name '*.service' \
-  -exec cp -a -t /etc/systemd/system/ {} +
+while read -r presence unit_name; do
+  if [ "$presence" = present ]; then
+    sudo cp -a -- "$UNIT_BACKUP/$unit_name" \
+      "/etc/systemd/system/$unit_name"
+  fi
+done < <(sudo cat "$UNIT_BACKUP/unit-files.txt")
 sudo systemctl daemon-reload
 while read -r unit state; do
   case "$unit" in
@@ -350,6 +479,10 @@ done < <(sudo cat "$UNIT_BACKUP/enablement.txt")
 sudo systemctl restart parking-service-bot parking-service-monitor
 sudo systemctl status parking-service-bot parking-service-monitor --no-pager
 ```
+
+The rollback preflight is intentionally before `disable --now`, Git checkout,
+or unit removal. Any missing, unreadable, empty, malformed, or incomplete
+backup aborts rollback without changing service state or installed units.
 
 The new notifier and Discord units remain disabled throughout rollback so a
 reboot cannot resurrect them. The recorded unit files and enablement are

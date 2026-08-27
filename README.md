@@ -84,6 +84,18 @@ sudo ./scripts/configure-secrets.sh
 sudo parking-monitor start
 ```
 
+Full setup adopts the checkout's `.git` metadata and an existing `venv`
+recursively for `parking_user`; it changes ownership only and never chmods
+virtual-environment internals, so executable entry points remain intact. After
+full setup, run Git and Python package operations as `parking_user`. Existing
+hosts should install verified unit changes through the narrow upgrade path:
+
+```bash
+sudo -u parking_user git pull --ff-only
+sudo -u parking_user venv/bin/python -m pip install -r requirements.txt
+sudo ./scripts/setup-service.sh --install-units
+```
+
 `configure-secrets.sh` prompts for Telegram and Discord bot tokens without
 echoing them. Do not start or restart services until that command succeeds.
 

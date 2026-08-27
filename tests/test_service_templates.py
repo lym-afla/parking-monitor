@@ -9,6 +9,7 @@ from pathlib import Path, PureWindowsPath
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SETUP_SCRIPT = PROJECT_ROOT / "scripts" / "setup-service.sh"
 MANAGEMENT_SCRIPT = PROJECT_ROOT / "scripts" / "manage-parking-monitor.sh"
+DEPLOYMENT_RUNBOOK = PROJECT_ROOT / "DEPLOYMENT.md"
 SERVICE_NAMES = (
     "parking-service-monitor",
     "parking-service-notifier",
@@ -215,7 +216,7 @@ show_logs -t {component} >/dev/null
                 self.assertIn(log_name, logged_text)
                 self.assertNotIn("journalctl ", logged_text)
 
-    def test_setup_permission_scope_never_recurses_over_venv(self):
+    def test_setup_adopts_git_and_venv_ownership_without_chmodding_venv(self):
         result, calls = self._run_sourced_script(
             SETUP_SCRIPT,
             """
@@ -224,19 +225,38 @@ VENV_DIR="$APP_DIR/venv"
 LOG_DIR="$APP_DIR/logs"
 CONFIG_DIR="$APP_DIR/config"
 APP_USER=parking_user
-mkdir -p "$VENV_DIR/bin" "$APP_DIR/scripts"
+mkdir -p "$VENV_DIR/bin" "$APP_DIR/.git" "$APP_DIR/scripts"
 touch "$VENV_DIR/bin/pip" "$APP_DIR/scripts/manage-parking-monitor.sh"
 chown() { printf 'chown %s\\n' "$*" >> "$CALL_LOG"; return 0; }
 chmod() { printf 'chmod %s\\n' "$*" >> "$CALL_LOG"; return 0; }
-find() { printf 'find %s\\n' "$*" >> "$CALL_LOG"; return 0; }
+sudo() {
+    if [ "$1" = -u ]; then shift 2; fi
+    "$@"
+}
+git() { return 0; }
 setup_permissions >/dev/null
 """,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        command_text = "\n".join(calls)
-        self.assertNotIn("chown -R parking_user:parking_user", command_text)
+        self.assertTrue(
+            any(
+                line.startswith("chown -R parking_user:parking_user ")
+                and line.endswith("/.git")
+                for line in calls
+            ),
+            calls,
+        )
+        self.assertTrue(
+            any(
+                line.startswith("chown -R parking_user:parking_user ")
+                and line.endswith("/venv")
+                for line in calls
+            ),
+            calls,
+        )
         for line in calls:
-            self.assertNotIn("/venv", line)
+            if line.startswith("chmod "):
+                self.assertNotIn("/venv", line)
 
     def test_setup_stops_on_stage_failure_without_false_success(self):
         result, _ = self._run_sourced_script(
@@ -312,6 +332,53 @@ test_service_units
         called_text = "\n".join(calls)
         for service_name in SERVICE_NAMES:
             self.assertIn(service_name, called_text)
+
+
+class OperatorDocumentationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.runbook = DEPLOYMENT_RUNBOOK.read_text(encoding="utf-8")
+
+    def test_upgrade_uses_parking_user_and_install_units_only(self):
+        deploy_section = self.runbook.split("## Deploy code without restarting", 1)[1]
+        deploy_section = deploy_section.split("## Install credentials privately", 1)[0]
+
+        self.assertIn("sudo -u parking_user git pull --ff-only", deploy_section)
+        self.assertIn(
+            "sudo -u parking_user venv/bin/python -m pip install",
+            deploy_section,
+        )
+        self.assertIn(
+            "sudo ./scripts/setup-service.sh --install-units",
+            deploy_section,
+        )
+        self.assertNotIn("\nsudo ./scripts/setup-service.sh\n", deploy_section)
+
+    def test_unit_backup_is_fail_closed_and_rollback_preflights_it(self):
+        predeployment = self.runbook.split("## Pre-deployment record", 1)[1]
+        predeployment = predeployment.split("## Deploy code without restarting", 1)[0]
+        rollback = self.runbook.split("## Rollback", 1)[1]
+
+        self.assertNotIn("2>/dev/null || true", predeployment)
+        for unit in ("parking-service-monitor.service", "parking-service-bot.service"):
+            self.assertIn(unit, predeployment)
+            self.assertIn(f'test -s "$UNIT_BACKUP/{unit}"', predeployment)
+            self.assertIn(f'test -r "$UNIT_BACKUP/{unit}"', predeployment)
+            self.assertIn(f'test -s "$UNIT_BACKUP/{unit}"', rollback)
+            self.assertIn(f'test -r "$UNIT_BACKUP/{unit}"', rollback)
+        self.assertIn("if sudo test -e", predeployment)
+        self.assertIn('test -s "$UNIT_BACKUP/enablement.txt"', predeployment)
+        self.assertIn('test -r "$UNIT_BACKUP/enablement.txt"', predeployment)
+        self.assertIn('test -s "$UNIT_BACKUP/enablement.txt"', rollback)
+        self.assertIn('test -r "$UNIT_BACKUP/enablement.txt"', rollback)
+        self.assertLess(
+            rollback.index('test -s "$UNIT_BACKUP/enablement.txt"'),
+            rollback.index("systemctl disable --now"),
+        )
+        self.assertLess(
+            rollback.index('test -s "$UNIT_BACKUP/enablement.txt"'),
+            rollback.index("sudo rm -f"),
+        )
 
 
 if __name__ == "__main__":
