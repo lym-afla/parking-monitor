@@ -1,4 +1,5 @@
 import json
+import secrets
 import sqlite3
 import tempfile
 import unittest
@@ -170,8 +171,9 @@ class NotificationStoreTests(unittest.TestCase):
     def test_store_sanitizes_and_bounds_errors(self):
         self.create_dual_channel_event()
         claim = self.store.claim_due("discord", NOW)
-        bot_token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
-        webhook = "https://discord.com/api/webhooks/1234/secret-value"
+        bot_token = self.synthetic_telegram_token()
+        webhook_secret = secrets.token_urlsafe(24)
+        webhook = f"https://discord.com/api/webhooks/1234/{webhook_secret}"
         raw_error = (
             f"request failed Authorization: Bot {bot_token}\n"
             f"POST {webhook} failed " + "x" * 800
@@ -180,8 +182,62 @@ class NotificationStoreTests(unittest.TestCase):
         self.store.mark_retry(claim, raw_error, NOW)
         stored_error = self.store.delivery(claim.event_id, "discord").last_error
 
-        self.assertNotIn(bot_token, stored_error)
-        self.assertNotIn("secret-value", stored_error)
+        self.assertFalse(
+            bot_token in stored_error,
+            "A token-shaped value was persisted",
+        )
+        self.assertFalse(
+            webhook_secret in stored_error,
+            "A webhook credential was persisted",
+        )
+        self.assertNotIn("Authorization", stored_error)
+        self.assertLessEqual(len(stored_error), 500)
+
+    def test_retry_redacts_a_supplied_discord_token_embedded_alone(self):
+        runtime_secret = self.synthetic_discord_token()
+        secret_aware_store = NotificationStore(
+            self.db_path, secrets=(runtime_secret,)
+        )
+        self.create_dual_channel_event()
+        claim = secret_aware_store.claim_due("discord", NOW)
+
+        secret_aware_store.mark_retry(
+            claim, f"Discord rejected bot credential {runtime_secret}", NOW
+        )
+        stored_error = secret_aware_store.delivery(
+            claim.event_id, "discord"
+        ).last_error
+
+        self.assertFalse(
+            runtime_secret in stored_error,
+            "A supplied runtime secret was persisted by mark_retry",
+        )
+        self.assertIn("[redacted-secret]", stored_error)
+        self.assertLessEqual(len(stored_error), 500)
+
+    def test_failed_redacts_a_supplied_secret_in_a_mapping_authorization_header(self):
+        runtime_secret = self.synthetic_discord_token()
+        secret_aware_store = NotificationStore(
+            self.db_path, secrets=(runtime_secret,)
+        )
+        self.create_dual_channel_event()
+        claim = secret_aware_store.claim_due("discord", NOW)
+        error = repr(
+            {
+                "Authorization": f"Bot {runtime_secret}",
+                "detail": "forbidden",
+            }
+        )
+
+        secret_aware_store.mark_failed(claim, error, NOW)
+        stored_error = secret_aware_store.delivery(
+            claim.event_id, "discord"
+        ).last_error
+
+        self.assertFalse(
+            runtime_secret in stored_error,
+            "A supplied runtime secret was persisted by mark_failed",
+        )
         self.assertNotIn("Authorization", stored_error)
         self.assertLessEqual(len(stored_error), 500)
 
@@ -283,6 +339,20 @@ class NotificationStoreTests(unittest.TestCase):
         self.assertEqual(journal_mode, "wal")
         self.assertTrue(foreign_keys)
         self.assertTrue(any(index[2] for index in indexes))
+
+    @staticmethod
+    def synthetic_discord_token():
+        return ".".join(
+            (
+                secrets.token_urlsafe(18),
+                secrets.token_urlsafe(6),
+                secrets.token_urlsafe(24),
+            )
+        )
+
+    @staticmethod
+    def synthetic_telegram_token():
+        return f"{secrets.randbelow(900_000_000) + 100_000_000}:{secrets.token_urlsafe(24)}"
 
 
 if __name__ == "__main__":

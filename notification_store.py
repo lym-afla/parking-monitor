@@ -52,8 +52,11 @@ class DeliveryRecord:
 class NotificationStore:
     """Own notification events and independent per-channel delivery lifecycle."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(
+        self, db_path: str | Path, secrets: Iterable[str] = ()
+    ):
         self._db_path = Path(db_path)
+        self._secrets = tuple(secret for secret in secrets if secret)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
 
@@ -249,7 +252,7 @@ class NotificationStore:
             (
                 next_attempt_at,
                 now_iso,
-                _sanitize_error(error),
+                sanitize_error(error, secrets=self._secrets),
                 claim.event_id,
                 claim.channel,
                 claim.claim_token,
@@ -278,7 +281,7 @@ class NotificationStore:
             """,
             (
                 now_iso,
-                _sanitize_error(error),
+                sanitize_error(error, secrets=self._secrets),
                 claim.event_id,
                 claim.channel,
                 claim.claim_token,
@@ -513,8 +516,16 @@ def _utc_iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
-def _sanitize_error(error: object) -> str:
+def sanitize_error(error: object, secrets: Iterable[str] = ()) -> str:
     text = str(error)
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret:
+            text = text.replace(secret, "[redacted-secret]")
+    text = re.sub(
+        r"(?i)['\"]authorization['\"]\s*:\s*(['\"])[^'\"]*\1\s*,?\s*",
+        "[redacted] ",
+        text,
+    )
     text = re.sub(
         r"(?i)\bauthorization\s*:[^\r\n]*(?:\r?\n)?", "[redacted] ", text
     )
