@@ -73,6 +73,34 @@ create_service_identities() {
     print_status "Four distinct service identities configured"
 }
 
+# Pin a regular file descriptor before changing metadata. O_NOFOLLOW prevents a
+# service-controlled symlink swap from redirecting privileged operations.
+secure_shared_file() {
+    local path="$1"
+    local mode="$2"
+    local create="${3:-false}"
+    python3 - "$path" "$RUNTIME_GROUP" "$mode" "$create" <<'PY'
+import grp
+import os
+import stat
+import sys
+
+path, group_name, mode_text, create_text = sys.argv[1:]
+flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+if create_text == "true":
+    flags |= os.O_CREAT
+fd = os.open(path, flags, 0o600)
+try:
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise OSError("refusing non-regular or multiply-linked runtime file")
+    os.fchown(fd, 0, grp.getgrnam(group_name).gr_gid)
+    os.fchmod(fd, int(mode_text, 8))
+finally:
+    os.close(fd)
+PY
+}
+
 # Set up directory permissions
 setup_permissions() {
     print_header "Setting up directory permissions..."
@@ -82,6 +110,17 @@ setup_permissions() {
         print_status "Please deploy the parking monitor application first"
         exit 1
     fi
+
+    local protected_path
+    for protected_path in \
+        "$RUNTIME_ROOT" "$DATA_DIR" "$PLAYWRIGHT_BROWSERS_PATH" \
+        "$LOG_DIR" "$CONFIG_DIR"
+    do
+        if [ -L "$protected_path" ]; then
+            print_error "Refusing symlink at protected path $protected_path"
+            return 1
+        fi
+    done
 
     mkdir -p "$DATA_DIR" "$PLAYWRIGHT_BROWSERS_PATH" "$LOG_DIR" "$CONFIG_DIR"
 
@@ -129,23 +168,36 @@ setup_permissions() {
         notifications.sqlite3-wal notifications.sqlite3-shm
     do
         if [ -e "$APP_DIR/$runtime_name" ] && [ ! -e "$DATA_DIR/$runtime_name" ]; then
-            mv -- "$APP_DIR/$runtime_name" "$DATA_DIR/$runtime_name"
+            mv -fT -- "$APP_DIR/$runtime_name" "$DATA_DIR/$runtime_name"
         fi
     done
 
     local runtime_path
-    for runtime_path in "$DATA_DIR"/*; do
-        if [ -e "$runtime_path" ]; then
-            chown root:"$RUNTIME_GROUP" "$runtime_path"
-            chmod 0660 "$runtime_path"
+    for runtime_name in \
+        state.json state.json.lock notifications.sqlite3 \
+        notifications.sqlite3-wal notifications.sqlite3-shm
+    do
+        runtime_path="$DATA_DIR/$runtime_name"
+        if [ -L "$runtime_path" ]; then
+            print_error "Refusing symlink at runtime path $runtime_path"
+            return 1
+        fi
+        if [ -f "$runtime_path" ]; then
+            secure_shared_file "$runtime_path" 0660 || return 1
+        elif [ -e "$runtime_path" ]; then
+            print_error "Refusing non-file runtime path $runtime_path"
+            return 1
         fi
     done
 
     local log_name
     for log_name in monitor.log notifier.log telegram.log discord.log; do
-        touch "$LOG_DIR/$log_name"
-        chown root:"$RUNTIME_GROUP" "$LOG_DIR/$log_name"
-        chmod 0640 "$LOG_DIR/$log_name"
+        protected_path="$LOG_DIR/$log_name"
+        if [ -L "$protected_path" ]; then
+            print_error "Refusing symlink at log path $protected_path"
+            return 1
+        fi
+        secure_shared_file "$protected_path" 0640 true || return 1
     done
 
     # Configure Git only for the root-owned operational checkout.

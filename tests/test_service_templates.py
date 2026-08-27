@@ -367,6 +367,7 @@ touch "$VENV_DIR/bin/pip" "$APP_DIR/scripts/manage-parking-monitor.sh" \
       "$APP_DIR/docs/nested/runbook.md"
 chown() { printf 'chown %s\\n' "$*" >> "$CALL_LOG"; return 0; }
 chmod() { printf 'chmod %s\\n' "$*" >> "$CALL_LOG"; return 0; }
+secure_shared_file() { printf 'secure %s\\n' "$*" >> "$CALL_LOG"; return 0; }
 git() { return 0; }
 setup_permissions >/dev/null
 """,
@@ -424,6 +425,40 @@ test ! -e "$DATA_DIR/notifications.sqlite3"
         )
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertTrue(any("parking-service-notifier" in call for call in calls))
+
+    def test_setup_ignores_unknown_service_controlled_runtime_entries(self):
+        result, calls = self._run_sourced_script(
+            SETUP_SCRIPT,
+            r'''
+APP_DIR="$TEST_ROOT/app"
+RUNTIME_ROOT="$TEST_ROOT/runtime"
+DATA_DIR="$RUNTIME_ROOT/data"
+PLAYWRIGHT_BROWSERS_PATH="$RUNTIME_ROOT/ms-playwright"
+LOG_DIR="$TEST_ROOT/logs"
+CONFIG_DIR="$TEST_ROOT/config"
+RUNTIME_GROUP=parking-monitor
+mkdir -p "$APP_DIR" "$DATA_DIR" "$PLAYWRIGHT_BROWSERS_PATH" \
+         "$LOG_DIR" "$CONFIG_DIR"
+touch "$DATA_DIR/attacker-controlled"
+chown() { printf 'chown %s\n' "$*" >> "$CALL_LOG"; return 0; }
+chmod() { printf 'chmod %s\n' "$*" >> "$CALL_LOG"; return 0; }
+secure_shared_file() { printf 'secure %s\n' "$*" >> "$CALL_LOG"; return 0; }
+setup_permissions >/dev/null
+''',
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertFalse(
+            any("attacker-controlled" in call for call in calls),
+            calls,
+        )
+        source = SETUP_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('if [ -L "$runtime_path" ]; then', source)
+        self.assertIn('if [ -L "$protected_path" ]; then', source)
+        self.assertNotIn('for runtime_path in "$DATA_DIR"/*', source)
+        self.assertIn("os.O_NOFOLLOW", source)
+        self.assertIn("os.fchmod", source)
+        self.assertNotIn('chmod 0660 "$runtime_path"', source)
 
     def test_management_command_is_installed_as_root_owned_copy_not_symlink(self):
         result, calls = self._run_sourced_script(
@@ -658,6 +693,29 @@ if run_update_transaction old-revision new-revision /stage /backup; then exit 41
             ],
         )
 
+    def test_rollback_refuses_mutation_until_every_service_is_inactive(self):
+        result, calls = self._run_sourced_script(
+            MANAGEMENT_SCRIPT,
+            r'''
+APP_DIR="$TEST_ROOT/app"
+RUNTIME_ROOT="$TEST_ROOT/runtime"
+systemctl() {
+    printf 'systemctl %s\n' "$*" >> "$CALL_LOG"
+    if [ "$1" = stop ] && [ "$2" = parking-service-notifier ]; then return 1; fi
+    if [ "$1" = is-active ] && [ "$3" = parking-service-notifier ]; then return 0; fi
+    if [ "$1" = is-active ]; then return 1; fi
+    return 0
+}
+git() { printf 'git %s\n' "$*" >> "$CALL_LOG"; return 0; }
+restore_runtime_snapshot() { printf 'restore reached\n' >> "$CALL_LOG"; }
+if rollback_update old-revision "$TEST_ROOT/backup"; then exit 41; fi
+''',
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertFalse(any(call.startswith("git ") for call in calls), calls)
+        self.assertNotIn("restore reached", calls)
+
     def test_fast_forward_checkout_uses_pull_ff_only(self):
         calls = self._run_sourced_command(
             """
@@ -779,6 +837,37 @@ test ! -e "$DATABASE_PATH-shm"
         )
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 
+    def test_restore_runtime_snapshot_repairs_shared_runtime_file_permissions(self):
+        result, calls = self._run_sourced_script(
+            MANAGEMENT_SCRIPT,
+            r'''
+DATA_DIR="$TEST_ROOT/data"
+STATE_PATH="$DATA_DIR/state.json"
+DATABASE_PATH="$DATA_DIR/notifications.sqlite3"
+APP_DIR="$TEST_ROOT/app"
+RUNTIME_GROUP=parking-monitor
+mkdir -p "$DATA_DIR" "$APP_DIR" "$TEST_ROOT/backup"
+printf '{}\n' > "$TEST_ROOT/backup/state.json"
+touch "$TEST_ROOT/backup/state.data" \
+      "$TEST_ROOT/backup/notifications.sqlite3" \
+      "$TEST_ROOT/backup/database.data"
+chown() { printf 'chown %s\n' "$*" >> "$CALL_LOG"; return 0; }
+chmod() { printf 'chmod %s\n' "$*" >> "$CALL_LOG"; return 0; }
+restore_shared_file() { command cp "$1" "$2"; }
+restore_runtime_snapshot "$TEST_ROOT/backup"
+''',
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        source = MANAGEMENT_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("os.O_NOFOLLOW", source)
+        self.assertIn("os.fchmod", source)
+        self.assertIn("tempfile.mkstemp", source)
+        self.assertIn("os.replace", source)
+        self.assertGreaterEqual(source.count("os.fsync(temp_fd)"), 2)
+        self.assertNotIn('"$state_target.restore"', source)
+        self.assertNotIn('"$database_target.restore"', source)
+
     def test_snapshot_restores_legacy_checkout_data_after_migration_rollback(self):
         result, _ = self._run_sourced_script(
             MANAGEMENT_SCRIPT,
@@ -818,6 +907,9 @@ install() {
     local destination="${@: -1}"
     mkdir -p "$destination"
 }
+chown() { :; }
+chmod() { :; }
+restore_shared_file() { command cp "$1" "$2"; }
 create_runtime_snapshot "$TEST_ROOT/backup"
 mv "$APP_DIR/state.json" "$STATE_PATH"
 mv "$APP_DIR/notifications.sqlite3" "$DATABASE_PATH"

@@ -16,6 +16,7 @@ DATABASE_PATH="${DATA_DIR}/notifications.sqlite3"
 PLAYWRIGHT_BROWSERS_PATH="${RUNTIME_ROOT}/ms-playwright"
 LOG_DIR="/var/log/parking-monitor"
 CONFIG_DIR="/etc/parking-monitor"
+RUNTIME_GROUP="parking-monitor"
 BACKUP_ROOT="${RUNTIME_ROOT}/backups"
 SYSTEMD_DIR="/etc/systemd/system"
 LOG_LINES=50
@@ -129,6 +130,55 @@ start_service() {
         print_status "🎉 All four services are running"
     fi
     status_service
+}
+
+# Restore a runtime file through pinned no-follow descriptors and atomically
+# replace the destination only after content and shared metadata are durable.
+restore_shared_file() {
+    local source_path="$1"
+    local target_path="$2"
+    "$VENV_DIR/bin/python" - "$source_path" "$target_path" "$RUNTIME_GROUP" <<'PY'
+import grp
+import os
+import shutil
+import stat
+import sys
+import tempfile
+
+source_path, target_path, group_name = sys.argv[1:]
+parent = os.path.dirname(target_path)
+name = os.path.basename(target_path)
+parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+source_fd = os.open(source_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+temp_fd = None
+temp_path = None
+try:
+    if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+        raise OSError("refusing non-regular runtime backup")
+    temp_fd, temp_path = tempfile.mkstemp(prefix=f".{name}.restore.", dir=parent)
+    with os.fdopen(source_fd, "rb", closefd=False) as source, os.fdopen(
+        temp_fd, "wb", closefd=False
+    ) as destination:
+        shutil.copyfileobj(source, destination)
+        destination.flush()
+        os.fsync(temp_fd)
+    os.fchown(temp_fd, 0, grp.getgrnam(group_name).gr_gid)
+    os.fchmod(temp_fd, 0o660)
+    os.fsync(temp_fd)
+    os.replace(os.path.basename(temp_path), name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    temp_path = None
+    os.fsync(parent_fd)
+finally:
+    if temp_fd is not None:
+        os.close(temp_fd)
+    os.close(source_fd)
+    os.close(parent_fd)
+    if temp_path is not None:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+PY
 }
 
 component_is_intentionally_disabled() {
@@ -539,8 +589,7 @@ restore_runtime_snapshot() {
             print_error "Runtime snapshot has no state location record"
             return 1
         fi
-        cp -a -- "$backup_dir/state.json" "$state_target.restore" || return 1
-        mv -f -- "$state_target.restore" "$state_target" || return 1
+        restore_shared_file "$backup_dir/state.json" "$state_target" || return 1
         rm -f -- "$state_other" || return 1
     elif [ -f "$backup_dir/state.absent" ]; then
         rm -f -- "$STATE_PATH" "$APP_DIR/state.json" || return 1
@@ -560,9 +609,8 @@ restore_runtime_snapshot() {
             print_error "Runtime snapshot has no database location record"
             return 1
         fi
-        cp -a -- "$backup_dir/notifications.sqlite3" \
-            "$database_target.restore" || return 1
-        mv -f -- "$database_target.restore" "$database_target" || return 1
+        restore_shared_file \
+            "$backup_dir/notifications.sqlite3" "$database_target" || return 1
         rm -f -- \
             "$database_target-wal" "$database_target-shm" \
             "$database_other" "$database_other-wal" "$database_other-shm" \
@@ -588,6 +636,12 @@ rollback_update() {
 
     for component in "${SERVICE_COMPONENTS[@]}"; do
         systemctl stop "${SERVICE_NAME}-${component}" || true
+    done
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        if systemctl is-active --quiet "${SERVICE_NAME}-${component}"; then
+            print_error "Rollback refused while ${SERVICE_NAME}-${component} is active"
+            return 1
+        fi
     done
     git reset --hard "$previous_revision" || return 1
     if [ -d "$old_venv" ]; then
