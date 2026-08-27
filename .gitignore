@@ -67,6 +67,8 @@ test-results/
 *.temp
 *.bak
 *.backup
+.worktrees/
+.superpowers/
 
 # Service files (when deployed locally)
 *.service
