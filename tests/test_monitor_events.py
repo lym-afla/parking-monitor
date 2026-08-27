@@ -1,8 +1,11 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+import monitor
 from monitor import apply_check_result
 from notification_store import NotificationStore
 
@@ -80,10 +83,162 @@ class MonitorEventTests(unittest.TestCase):
         self.assertIs(state["last_enabled"], False)
         self.assertEqual(state["hits"], 3)
 
+    def test_store_initialization_retries_before_scraping(self):
+        saved_states = []
+        site_checks = []
+        sleeps = []
+        factory_calls = []
+
+        def load_saved_state():
+            if saved_states:
+                return saved_states[-1].copy()
+            return {
+                "last_enabled": False,
+                "checks": 0,
+                "hits": 0,
+                "interval": 1800,
+            }
+
+        def save_in_memory(state):
+            saved_states.append(state.copy())
+
+        def initialize_store(_database_path):
+            factory_calls.append(True)
+            if len(factory_calls) == 1:
+                raise RuntimeError("TOKEN-SHOULD-NOT-BE-STORED")
+            return self.store
+
+        def check_once_ready():
+            site_checks.append(True)
+            return False
+
+        def stop_after_second_cycle(interval):
+            sleeps.append(interval)
+            if len(sleeps) == 2:
+                raise _MonitorStopped()
+
+        real_polling_schedule = monitor.get_polling_schedule
+
+        def fixed_polling_schedule(normal_interval):
+            return real_polling_schedule(
+                datetime(2026, 8, 20, tzinfo=timezone.utc),
+                normal_interval=normal_interval,
+            )
+
+        with (
+            patch.object(monitor, "load_state", side_effect=load_saved_state),
+            patch.object(monitor, "save_state", side_effect=save_in_memory),
+            patch.object(monitor, "check_site", side_effect=check_once_ready),
+            patch.object(
+                monitor,
+                "get_polling_schedule",
+                side_effect=fixed_polling_schedule,
+            ),
+            patch.object(monitor.time, "sleep", side_effect=stop_after_second_cycle),
+            patch.object(monitor, "log"),
+            patch("traceback.print_exc"),
+        ):
+            with self.assertRaises(_MonitorStopped):
+                monitor.run_monitor(initialize_store)
+
+        self.assertEqual(len(factory_calls), 2)
+        self.assertEqual(len(site_checks), 1)
+        self.assertEqual(saved_states[1]["checks"], 1)
+        self.assertIsNone(saved_states[1]["error"])
+        self.assertIn("initialization failed", saved_states[0]["error"])
+        self.assertNotIn("TOKEN-SHOULD-NOT-BE-STORED", saved_states[0]["error"])
+        self.assertEqual(sleeps, [1800, 1800])
+
+    def test_atomic_save_preserves_existing_state_at_each_failure_point(self):
+        original_state = {
+            "last_enabled": False,
+            "checks": 41,
+            "hits": 3,
+            "interval": 1800,
+        }
+        replacement_state = {**original_state, "checks": 42}
+        original_json = json.dumps(original_state)
+
+        for failure_point in ("staging", "write", "replace"):
+            with self.subTest(failure_point=failure_point):
+                case_directory = (
+                    Path(self.temporary_directory.name) / failure_point
+                )
+                case_directory.mkdir()
+                state_path = case_directory / "state.json"
+                state_path.write_text(original_json, encoding="utf-8")
+
+                if failure_point == "staging":
+                    failure = patch.object(
+                        monitor.tempfile,
+                        "NamedTemporaryFile",
+                        side_effect=OSError("staging failed"),
+                    )
+                elif failure_point == "write":
+                    failure = patch.object(
+                        monitor.json,
+                        "dump",
+                        side_effect=OSError("write failed"),
+                    )
+                else:
+                    failure = patch.object(
+                        monitor.os,
+                        "replace",
+                        side_effect=OSError("replace failed"),
+                    )
+
+                with patch.object(monitor, "STATE_FILE", str(state_path)), failure:
+                    with self.assertRaises(OSError):
+                        monitor.save_state(replacement_state)
+
+                self.assertEqual(
+                    json.loads(state_path.read_text(encoding="utf-8")),
+                    original_state,
+                )
+                self.assertEqual(
+                    {path.name for path in case_directory.iterdir()},
+                    {"state.json"},
+                )
+
+    def test_transition_retry_after_state_save_failure_reuses_event(self):
+        state_path = Path(self.temporary_directory.name) / "state.json"
+        original_state = {
+            "last_enabled": False,
+            "checks": 41,
+            "hits": 3,
+            "interval": 1800,
+        }
+        state_path.write_text(json.dumps(original_state), encoding="utf-8")
+
+        with patch.object(monitor, "STATE_FILE", str(state_path)):
+            first_attempt = monitor.load_state()
+            apply_check_result(first_attempt, enabled=True, store=self.store)
+            with patch.object(
+                monitor.os,
+                "replace",
+                side_effect=OSError("replace failed"),
+            ):
+                with self.assertRaises(OSError):
+                    monitor.save_state(first_attempt)
+
+            retry = monitor.load_state()
+            apply_check_result(retry, enabled=True, store=self.store)
+            monitor.save_state(retry)
+
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(self.store.event_count(), 1)
+        self.assertEqual(persisted["checks"], 42)
+        self.assertEqual(persisted["hits"], 4)
+        self.assertIs(persisted["last_enabled"], True)
+
 
 class _FailingStore:
     def create_event(self, *args, **kwargs):
         raise RuntimeError("database unavailable")
+
+
+class _MonitorStopped(Exception):
+    pass
 
 
 if __name__ == "__main__":

@@ -1,11 +1,19 @@
 import time
 import json
+import os
 import sys
+import tempfile
 import calendar
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from playwright.sync_api import sync_playwright
-from config import *
+from config import (
+    CHECK_INTERVAL_SECONDS,
+    STATE_FILE,
+    TARGET_ADDRESS_TEXT,
+    TARGET_REGION_TEXT,
+    URL,
+)
 
 MOSCOW_TIMEZONE = timezone(timedelta(hours=3), "MSK")
 MONTH_END_INTERVAL_SECONDS = 300
@@ -61,8 +69,37 @@ def load_state():
         return {"checks": 0, "hits": 0, "last_enabled": False, "interval": CHECK_INTERVAL_SECONDS}
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+    state_path = Path(STATE_FILE)
+    temporary_path = None
+    try:
+        try:
+            existing_mode = state_path.stat().st_mode
+        except FileNotFoundError:
+            existing_mode = None
+
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=state_path.parent,
+            prefix=f".{state_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            json.dump(state, temporary_file)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+
+        if existing_mode is not None:
+            os.chmod(temporary_path, existing_mode)
+        os.replace(temporary_path, state_path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def apply_check_result(state, enabled, store):
@@ -125,21 +162,23 @@ def check_site():
         log(f"Check complete. Parking available: {enabled}")
         return enabled
 
-def main():
-    from notification_store import NotificationStore
-
-    log("=== Parking Monitor Service Started ===")
-    log(f"State file: {STATE_FILE}")
-    log(f"Target: {TARGET_ADDRESS_TEXT}, {TARGET_REGION_TEXT}")
-
-    initial_state = load_state()
-    log(f"Loaded state: checks={initial_state.get('checks', 0)}, hits={initial_state.get('hits', 0)}, interval={initial_state.get('interval', CHECK_INTERVAL_SECONDS)}s")
-    store = NotificationStore(DATABASE_PATH)
-
+def run_monitor(store_factory):
+    """Run checks forever, retrying notification-store initialization safely."""
+    store = None
     while True:
         try:
             # Reload state to pick up interval changes from Telegram bot
             state = load_state()
+
+            if store is None:
+                try:
+                    store = store_factory(DATABASE_PATH)
+                except Exception as error:
+                    error_class = type(error).__name__
+                    raise RuntimeError(
+                        "Notification store initialization failed "
+                        f"({error_class})"
+                    ) from None
 
             enabled = check_site()
             was_enabled = state.get("last_enabled", False)
@@ -164,7 +203,13 @@ def main():
             # Reload state to ensure we don't overwrite interval changes
             state = load_state()
             state["error"] = str(e)
-            save_state(state)
+            try:
+                save_state(state)
+            except Exception as state_error:
+                log(
+                    "ERROR: State persistence failed "
+                    f"({type(state_error).__name__})"
+                )
             interval, polling_mode = get_polling_schedule(
                 normal_interval=state.get("interval", CHECK_INTERVAL_SECONDS)
             )
@@ -174,6 +219,18 @@ def main():
             )
 
         time.sleep(interval)
+
+
+def main():
+    from notification_store import NotificationStore
+
+    log("=== Parking Monitor Service Started ===")
+    log(f"State file: {STATE_FILE}")
+    log(f"Target: {TARGET_ADDRESS_TEXT}, {TARGET_REGION_TEXT}")
+
+    initial_state = load_state()
+    log(f"Loaded state: checks={initial_state.get('checks', 0)}, hits={initial_state.get('hits', 0)}, interval={initial_state.get('interval', CHECK_INTERVAL_SECONDS)}s")
+    run_monitor(NotificationStore)
 
 if __name__ == "__main__":
     main()
