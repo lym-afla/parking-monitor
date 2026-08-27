@@ -76,6 +76,8 @@ class CommandService:
         )
 
     def set_normal_interval(self, seconds: int) -> StatusSnapshot:
+        if type(seconds) is not int:
+            raise ValueError("Interval must be an integer number of seconds")
         if not MINIMUM_INTERVAL_SECONDS <= seconds <= MAXIMUM_INTERVAL_SECONDS:
             raise ValueError(
                 f"Interval must be between {MINIMUM_INTERVAL_SECONDS} and "

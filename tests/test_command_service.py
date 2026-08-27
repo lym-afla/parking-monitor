@@ -59,6 +59,24 @@ class CommandServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "60.*86400"):
             self.service.set_normal_interval(30)
 
+    def test_rejects_fractional_interval(self):
+        with self.assertRaisesRegex(ValueError, "integer"):
+            self.service.set_normal_interval(60.5)
+
+    def test_rejects_boolean_interval(self):
+        with self.assertRaisesRegex(ValueError, "integer"):
+            self.service.set_normal_interval(True)
+
+    def test_accepts_interval_range_endpoints(self):
+        self.assertEqual(
+            self.service.set_normal_interval(60).normal_interval_seconds,
+            60,
+        )
+        self.assertEqual(
+            self.service.set_normal_interval(86400).normal_interval_seconds,
+            86400,
+        )
+
     def test_stats_reports_monitor_totals_and_channel_health(self):
         health = {
             "telegram": {
