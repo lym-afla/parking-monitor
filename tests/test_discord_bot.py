@@ -38,12 +38,17 @@ def interaction(
     guild_id=GUILD_ID,
     channel_id=CHANNEL_ID,
     user_id=AUTHORIZED_USER_ID,
+    response_done=False,
 ):
     return SimpleNamespace(
         guild_id=guild_id,
         channel_id=channel_id,
         user=SimpleNamespace(id=user_id),
-        response=SimpleNamespace(send_message=AsyncMock()),
+        response=SimpleNamespace(
+            is_done=MagicMock(return_value=response_done),
+            send_message=AsyncMock(),
+        ),
+        followup=SimpleNamespace(send=AsyncMock()),
     )
 
 
@@ -141,6 +146,38 @@ class DiscordAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Invalid interval", args[0])
         self.assertTrue(kwargs["ephemeral"])
 
+    async def test_backend_exception_before_response_gets_sanitized_ephemeral_error(self):
+        secret = "discord-secret-token-in-backend-error"
+        request = interaction()
+        self.command_service.status.side_effect = RuntimeError(secret)
+
+        with self.assertLogs("parking_discord_bot", level="ERROR") as captured:
+            await self.commands.status(request)
+
+        request.response.send_message.assert_awaited_once_with(
+            "Unable to complete this request right now.", ephemeral=True
+        )
+        request.followup.send.assert_not_awaited()
+        combined_output = "\n".join(captured.output)
+        self.assertIn("RuntimeError", combined_output)
+        self.assertNotIn(secret, combined_output)
+        self.assertNotIn(secret, str(request.response.send_message.await_args))
+
+    async def test_interval_unexpected_backend_exception_uses_error_boundary(self):
+        secret = "interval-state-secret"
+        request = interaction()
+        self.command_service.set_normal_interval.side_effect = OSError(secret)
+
+        with self.assertLogs("parking_discord_bot", level="ERROR") as captured:
+            await self.commands.interval(request, minutes=15)
+
+        request.response.send_message.assert_awaited_once_with(
+            "Unable to complete this request right now.", ephemeral=True
+        )
+        combined_output = "\n".join(captured.output)
+        self.assertIn("OSError", combined_output)
+        self.assertNotIn(secret, combined_output)
+
 
 class DiscordPersistentControlsTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -183,6 +220,26 @@ class DiscordPersistentControlsTests(unittest.IsolatedAsyncioTestCase):
         request.response.send_message.assert_awaited_once_with(
             "This interaction is not authorized.", ephemeral=True
         )
+
+    async def test_backend_exception_after_response_uses_sanitized_ephemeral_followup(self):
+        secret = "state-payload-secret-from-backend"
+        request = interaction(response_done=True)
+        self.command_service.stats.side_effect = LookupError(secret)
+        stats_button = next(
+            item for item in self.view.children if item.custom_id == "parking:stats"
+        )
+
+        with self.assertLogs("parking_discord_bot", level="ERROR") as captured:
+            await stats_button.callback(request)
+
+        request.response.send_message.assert_not_awaited()
+        request.followup.send.assert_awaited_once_with(
+            "Unable to complete this request right now.", ephemeral=True
+        )
+        combined_output = "\n".join(captured.output)
+        self.assertIn("LookupError", combined_output)
+        self.assertNotIn(secret, combined_output)
+        self.assertNotIn(secret, str(request.followup.send.await_args))
 
 
 class DiscordBotConfigurationTests(unittest.IsolatedAsyncioTestCase):

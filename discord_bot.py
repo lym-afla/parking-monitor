@@ -2,6 +2,7 @@
 
 import logging
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import discord
 from discord import app_commands
@@ -14,6 +15,7 @@ from notification_store import NotificationStore
 
 LOGGER = logging.getLogger("parking_discord_bot")
 DATABASE_PATH = Path(__file__).with_name("notifications.sqlite3")
+GENERIC_FAILURE_MESSAGE = "Unable to complete this request right now."
 
 
 def is_authorized(interaction: discord.Interaction, config: RuntimeConfig) -> bool:
@@ -94,6 +96,35 @@ class DiscordCommands:
         self._command_service = command_service
         self._config = config
 
+    async def _execute(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        operation: Callable[[], Awaitable[None]],
+    ) -> None:
+        try:
+            if not await self._authorize(interaction, action):
+                return
+            await operation()
+        except Exception as exc:
+            await self._handle_error(interaction, action, exc)
+
+    @staticmethod
+    async def _handle_error(
+        interaction: discord.Interaction, action: str, exc: Exception
+    ) -> None:
+        LOGGER.error(
+            "Discord action failed action=%s error_type=%s",
+            action,
+            type(exc).__name__,
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(GENERIC_FAILURE_MESSAGE, ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                GENERIC_FAILURE_MESSAGE, ephemeral=True
+            )
+
     async def _authorize(self, interaction: discord.Interaction, action: str) -> bool:
         if is_authorized(interaction, self._config):
             return True
@@ -111,15 +142,19 @@ class DiscordCommands:
         return False
 
     async def status(self, interaction: discord.Interaction) -> None:
-        if not await self._authorize(interaction, "status"):
-            return
+        await self._execute(
+            interaction, "status", lambda: self._send_status(interaction)
+        )
+
+    async def _send_status(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
             format_status_message(self._command_service.status()), ephemeral=True
         )
 
     async def stats(self, interaction: discord.Interaction) -> None:
-        if not await self._authorize(interaction, "stats"):
-            return
+        await self._execute(interaction, "stats", lambda: self._send_stats(interaction))
+
+    async def _send_stats(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
             format_stats_message(self._command_service.stats()), ephemeral=True
         )
@@ -127,8 +162,15 @@ class DiscordCommands:
     async def interval(
         self, interaction: discord.Interaction, minutes: int | None = None
     ) -> None:
-        if not await self._authorize(interaction, "interval"):
-            return
+        await self._execute(
+            interaction,
+            "interval",
+            lambda: self._send_interval(interaction, minutes),
+        )
+
+    async def _send_interval(
+        self, interaction: discord.Interaction, minutes: int | None
+    ) -> None:
         if minutes is None:
             status = self._command_service.status()
             message = (
