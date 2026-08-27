@@ -98,7 +98,11 @@ sudo parking-monitor logs
 sudo parking-monitor logs -f
 sudo parking-monitor logs -t notifier -n 100
 sudo parking-monitor logs -t discord -n 100
+sudo parking-monitor logs -t systemd -n 100  # unit lifecycle only
 ```
+
+The normal and component log commands read the dedicated files under `logs/`;
+systemd journal output is an explicit unit-lifecycle diagnostic mode.
 
 ## Bot commands
 

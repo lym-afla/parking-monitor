@@ -11,6 +11,7 @@ APP_DIR="/opt/parking_monitor"
 APP_USER="parking_user"
 VENV_DIR="/opt/parking_monitor/venv"
 LOG_DIR="/opt/parking_monitor/logs"
+ENV_FILE="/etc/parking-monitor.env"
 LOG_LINES=50
 GITHUB_REPO_URL="https://github.com/yourusername/parking-monitor.git"  # Update with actual repo
 BRANCH_NAME="main"  # Adjust to your branch
@@ -203,6 +204,46 @@ status_service() {
 }
 
 # Show logs
+component_log_file() {
+    case "$1" in
+        monitor) echo "$LOG_DIR/monitor.log" ;;
+        notifier) echo "$LOG_DIR/notifier.log" ;;
+        bot|telegram) echo "$LOG_DIR/telegram.log" ;;
+        discord) echo "$LOG_DIR/discord.log" ;;
+        *) return 2 ;;
+    esac
+}
+
+tail_log_files() {
+    local follow_logs="$1"
+    shift
+    local requested_files=("$@")
+    local existing_files=()
+    local log_file
+
+    for log_file in "${requested_files[@]}"; do
+        if [ -f "$log_file" ]; then
+            existing_files+=("$log_file")
+        else
+            print_warning "Log file not found: $log_file"
+        fi
+    done
+    if [ "${#existing_files[@]}" -eq 0 ]; then
+        print_error "No application log files are available"
+        return 1
+    fi
+
+    if "$follow_logs"; then
+        tail -F -- "${existing_files[@]}"
+    else
+        for log_file in "${existing_files[@]}"; do
+            print_status "$(basename "$log_file"):"
+            tail -n "$LOG_LINES" -- "$log_file"
+            echo
+        done
+    fi
+}
+
 show_logs() {
     check_root_for_command "logs"
     local follow_logs=false
@@ -229,6 +270,11 @@ show_logs() {
         esac
     done
 
+    if ! [[ "$LOG_LINES" =~ ^[1-9][0-9]*$ ]]; then
+        print_error "Log line count must be a positive integer"
+        return 2
+    fi
+
     print_header "Showing logs (type: $log_type, lines: $LOG_LINES)..."
 
     local journal_args=()
@@ -245,15 +291,21 @@ show_logs() {
     )
 
     case $log_type in
-        service|systemd)
+        service|python|app|file|all)
+            tail_log_files "$follow_logs" "${log_files[@]}"
+            ;;
+        systemd|journal)
             if $follow_logs; then
-                print_status "Following all four service logs (Ctrl+C to stop)..."
+                print_status "Following systemd unit-status journal (Ctrl+C to stop)..."
                 journalctl "${journal_args[@]}" -f
             else
                 journalctl "${journal_args[@]}" -n "${LOG_LINES}" --no-pager
             fi
             ;;
-        python|app|file)
+        monitor|notifier|bot|telegram|discord)
+            tail_log_files "$follow_logs" "$(component_log_file "$log_type")"
+            ;;
+        error|errors)
             local existing_logs=()
             local log_file
             for log_file in "${log_files[@]}"; do
@@ -262,53 +314,48 @@ show_logs() {
                 fi
             done
             if [ "${#existing_logs[@]}" -eq 0 ]; then
-                print_warning "Application log files not found; using journalctl"
-                if $follow_logs; then
-                    journalctl "${journal_args[@]}" -f
-                else
-                    journalctl "${journal_args[@]}" -n "${LOG_LINES}" --no-pager
-                fi
-            elif $follow_logs; then
-                print_status "Following available application logs (Ctrl+C to stop)..."
-                tail -f "${existing_logs[@]}"
-            else
-                for log_file in "${existing_logs[@]}"; do
-                    print_status "$(basename "$log_file"):"
-                    tail -n "${LOG_LINES}" "$log_file"
-                    echo
-                done
+                print_error "No application log files are available"
+                return 1
             fi
-            ;;
-        monitor|notifier|bot|telegram|discord)
-            if [ "$log_type" = "telegram" ]; then
-                component=bot
-            else
-                component="$log_type"
-            fi
-            if $follow_logs; then
-                journalctl -u "${SERVICE_NAME}-${component}" -f
-            else
-                journalctl -u "${SERVICE_NAME}-${component}" -n "${LOG_LINES}" --no-pager
-            fi
-            ;;
-        error|errors)
-            print_status "Showing error logs from all four services..."
-            journalctl "${journal_args[@]}" -n "${LOG_LINES}" --no-pager -p err
-            ;;
-        all)
-            print_status "Showing all logs from all four services..."
-            if $follow_logs; then
-                journalctl "${journal_args[@]}" -f
-            else
-                journalctl "${journal_args[@]}" -n "${LOG_LINES}" --no-pager
-            fi
+            grep -H -i -E -- \
+                'error|exception|failed|authentication|unauthorized|forbidden' \
+                "${existing_logs[@]}" | tail -n "$LOG_LINES" || true
             ;;
         *)
             print_error "Unknown log type: $log_type"
-            print_status "Available types: service, python, monitor, notifier, bot, discord, file, error, all"
+            print_status "Available types: service, systemd, monitor, notifier, bot, discord, file, error, all"
             exit 1
             ;;
     esac
+}
+
+RUNNING_BEFORE_UPDATE=()
+
+capture_and_stop_running_services() {
+    check_service_exists
+    RUNNING_BEFORE_UPDATE=()
+    local component
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        if systemctl is-active --quiet "${SERVICE_NAME}-${component}"; then
+            RUNNING_BEFORE_UPDATE+=("$component")
+            systemctl stop "${SERVICE_NAME}-${component}"
+        fi
+    done
+}
+
+restore_running_services() {
+    local component
+    local failed=false
+    for component in "${RUNNING_BEFORE_UPDATE[@]}"; do
+        systemctl start "${SERVICE_NAME}-${component}"
+        if ! systemctl is-active --quiet "${SERVICE_NAME}-${component}"; then
+            print_error "${component} service failed to return after update"
+            failed=true
+        fi
+    done
+    if "$failed"; then
+        return 1
+    fi
 }
 
 # Update application
@@ -332,13 +379,6 @@ update_app() {
         exit 1
     }
 
-    # Check if service is running (we'll need to restart it)
-    local was_running=false
-    if systemctl is-active --quiet "${SERVICE_NAME}"; then
-        was_running=true
-        print_status "Service is running, will restart after update"
-    fi
-
     # Backup current version info
     local current_commit=$(sudo -u "$APP_USER" git rev-parse HEAD 2>/dev/null || echo "unknown")
     print_status "Current version: ${current_commit:0:8}"
@@ -352,122 +392,120 @@ update_app() {
     fi
 
     # Check if there are updates
-    local latest_commit=$(sudo -u "$APP_USER" git rev-parse origin/${BRANCH_NAME} 2>/dev/null)
-    if [ "$current_commit" = "$latest_commit" ]; then
-        print_status "Already up to date"
+    local latest_commit
+    if ! latest_commit=$(sudo -u "$APP_USER" git rev-parse "origin/${BRANCH_NAME}"); then
+        print_error "Cannot resolve origin/${BRANCH_NAME}"
         cd "${ORIGINAL_DIR}"
-        return
+        return 1
+    fi
+    if [ "$current_commit" = "$latest_commit" ]; then
+        print_status "Already up to date; reconciling current service units"
+        if ! "$APP_DIR/scripts/setup-service.sh" --install-units; then
+            print_error "Service unit reconciliation failed"
+            cd "${ORIGINAL_DIR}"
+            return 1
+        fi
+        cd "${ORIGINAL_DIR}"
+        return 0
     fi
 
-    # Stop service if running
-    if $was_running; then
-        print_status "Stopping service for update..."
-        systemctl stop "${SERVICE_NAME}"
-    fi
+    print_status "Stopping currently active services for update..."
+    capture_and_stop_running_services
 
     # Pull latest changes
     print_status "Pulling latest version..."
     if ! sudo -u "$APP_USER" git pull origin ${BRANCH_NAME}; then
         print_error "Failed to pull latest changes"
+        restore_running_services || true
         cd "${ORIGINAL_DIR}"
-        exit 1
+        return 1
     fi
 
     # Show what changed
-    local new_commit=$(sudo -u "$APP_USER" git rev-parse HEAD)
+    local new_commit
+    if ! new_commit=$(sudo -u "$APP_USER" git rev-parse HEAD); then
+        print_error "Cannot resolve updated revision"
+        restore_running_services || true
+        cd "${ORIGINAL_DIR}"
+        return 1
+    fi
     print_status "Updated to version: ${new_commit:0:8}"
 
     if [ "$current_commit" != "unknown" ] && [ "$current_commit" != "$new_commit" ]; then
         echo
         print_status "Changes in this update:"
-        sudo -u "$APP_USER" git log --oneline "${current_commit}..${new_commit}" | head -10
+        sudo -u "$APP_USER" git log --oneline "${current_commit}..${new_commit}" | head -10 || true
         echo
     fi
 
-    # Update file permissions and git config
-    print_status "Updating file permissions..."
-    chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
-    chmod +x "${APP_DIR}/scripts/"*.sh 2>/dev/null || true
-
-    # Ensure management script and symlink remain executable after updates
-    chmod +x "${APP_DIR}/scripts/manage-parking-monitor.sh"
-
-    # Fix symlink permissions - remove and recreate if needed
-    if [ -L "/usr/local/bin/parking-monitor" ]; then
-        rm -f "/usr/local/bin/parking-monitor"
+    # Preserve the virtual environment and apply executable mode only to
+    # reviewed operator scripts.
+    print_status "Updating script permissions..."
+    if ! chmod 0755 "${APP_DIR}/scripts/"*.sh; then
+        print_error "Could not restore operator script modes"
+        restore_running_services || true
+        cd "${ORIGINAL_DIR}"
+        return 1
     fi
-    ln -sf "${APP_DIR}/scripts/manage-parking-monitor.sh" "/usr/local/bin/parking-monitor"
-    chmod +x "/usr/local/bin/parking-monitor"
-
-    print_status "Symlink recreated and permissions fixed"
-
-    # Configure git to ignore file mode changes and reset any phantom changes
-    sudo -u "${APP_USER}" bash -c "
-        cd '${APP_DIR}'
-        git config core.filemode false
-        git config core.autocrlf false
-        git config --global --add safe.directory '${APP_DIR}'
-        git checkout -- . 2>/dev/null || true
-    "
-
-    # Also add safe.directory for root user (for future updates)
-    git config --global --add safe.directory "${APP_DIR}" 2>/dev/null || true
 
     # Activate virtual environment and update dependencies
     print_status "Updating Python dependencies..."
-    if [ -f "${VENV_DIR}/bin/activate" ]; then
-        # Use the app user to update dependencies
-        sudo -u "${APP_USER}" bash -c "
-            source '${VENV_DIR}/bin/activate'
-            pip install -r '${APP_DIR}/requirements.txt' --quiet --upgrade
-        " 2>/dev/null
-
-        if [ $? -eq 0 ]; then
-            print_status "Dependencies updated successfully"
-        else
-            print_warning "Some dependencies may not have updated properly"
-        fi
-    else
-        print_warning "Virtual environment not found, skipping dependency update"
-    fi
-
-    # Reload systemd if service files changed
-    if sudo -u "$APP_USER" git diff --name-only "${current_commit}..${new_commit}" 2>/dev/null | grep -q "\.service$"; then
-        print_status "Service file changed, reloading systemd..."
-        systemctl daemon-reload
-    fi
-
-    # Restart service if it was running
-    if $was_running; then
-        print_status "Restarting service..."
-        systemctl start "${SERVICE_NAME}"
-
-        # Wait a moment and check status
-        sleep 3
-        if systemctl is-active --quiet "${SERVICE_NAME}"; then
-            print_status "Service restarted successfully"
-        else
-            print_error "Service failed to start after update"
-            print_status "Check logs for details:"
-            journalctl -u "${SERVICE_NAME}" -n 20 --no-pager
+    if [ -x "${VENV_DIR}/bin/python" ]; then
+        if ! sudo -u "${APP_USER}" "${VENV_DIR}/bin/python" -m pip \
+            install -r "${APP_DIR}/requirements.txt" --quiet --upgrade; then
+            print_error "Dependency update failed"
+            restore_running_services || true
             cd "${ORIGINAL_DIR}"
-            exit 1
+            return 1
         fi
+        print_status "Dependencies updated successfully"
+    else
+        print_error "Virtual environment not found; update aborted"
+        restore_running_services || true
+        cd "${ORIGINAL_DIR}"
+        return 1
+    fi
+
+    # Reconcile the four rendered units on every update. This also removes the
+    # obsolete aggregate unit and verifies daemon-reload/enable operations.
+    if ! "$APP_DIR/scripts/setup-service.sh" --install-units; then
+        print_error "Service unit installation failed"
+        restore_running_services || true
+        cd "${ORIGINAL_DIR}"
+        return 1
+    fi
+    if ! restore_running_services; then
+        print_error "One or more services failed after update"
+        cd "${ORIGINAL_DIR}"
+        return 1
     fi
 
     cd "${ORIGINAL_DIR}"
 
-    # Verify symlink is working
-    print_status "Verifying symlink functionality..."
-    if [ -x "/usr/local/bin/parking-monitor" ]; then
-        print_status "Symlink is executable and working"
-    else
-        print_warning "Symlink may have permission issues"
-        print_status "Fixing symlink permissions..."
-        chmod +x "/usr/local/bin/parking-monitor"
-    fi
-
     print_status "Update completed successfully!"
+}
+
+test_service_units() {
+    local component
+    local failed=false
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        local unit="${SERVICE_NAME}-${component}"
+        if systemctl is-enabled --quiet "$unit"; then
+            echo "  ${component}: enabled"
+        else
+            echo "  ${component}: NOT ENABLED"
+            failed=true
+        fi
+        if systemctl is-active --quiet "$unit"; then
+            echo "  ${component}: active"
+        else
+            echo "  ${component}: NOT ACTIVE"
+            failed=true
+        fi
+    done
+    if "$failed"; then
+        return 1
+    fi
 }
 
 # Test system
@@ -480,7 +518,7 @@ test_system() {
     # Test 1: Virtual environment
     echo
     print_status "Test 1: Virtual Environment"
-    if [ -d "$VENV_DIR" ] && [ -f "$VENV_DIR/bin/python" ]; then
+    if [ -d "$VENV_DIR" ] && [ -x "$VENV_DIR/bin/python" ]; then
         echo "  ✅ Virtual environment exists at $VENV_DIR"
         echo "  Python version: $($VENV_DIR/bin/python --version)"
     else
@@ -497,6 +535,11 @@ test_system() {
         $VENV_DIR/bin/python -c "
 try:
     import telegram_bot
+    import discord_bot
+    import notifier
+    import notification_store
+    import command_service
+    import monitor
     import config
     print('  ✅ All Python imports successful')
 except Exception as e:
@@ -521,50 +564,40 @@ except Exception as e:
         fi
     fi
 
-    # Test 4: Service status
+    # Test 4: all current service units
     echo
     print_status "Test 4: Service Status"
-    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
-        echo "  ✅ Service is enabled (will start on boot)"
-    else
-        echo "  ⚠️  Service is not enabled"
-    fi
+    test_service_units || all_tests_passed=false
 
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        echo "  ✅ Service is running"
-    else
-        echo "  ❌ Service is not running"
-        echo "     Start with: sudo parking-monitor start"
-    fi
-
-    # Test 5: Configuration file
+    # Test 5: root-owned environment file metadata and required names. Values
+    # are never printed.
     echo
     print_status "Test 5: Configuration"
-    if [ -f "$APP_DIR/config.py" ]; then
-        echo "  ✅ Configuration file exists (config.py)"
-
-        # Check for required configuration variables
-        if [ -d "$VENV_DIR" ]; then
-            source "$VENV_DIR/bin/activate"
-            cd "$APP_DIR"
-            $VENV_DIR/bin/python -c "
-import config
-required_vars = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
-missing_vars = []
-for var in required_vars:
-    if not hasattr(config, var) or getattr(config, var) == '' or getattr(config, var).startswith('YOUR_'):
-        missing_vars.append(var)
-
-if missing_vars:
-    print(f'  ⚠️  Missing or unconfigured variables: {\", \".join(missing_vars)}')
-    exit(1)
-else:
-    print('  ✅ All required configuration variables present')
-" || all_tests_passed=false
-        fi
-    else
-        echo "  ❌ Configuration file not found at $APP_DIR/config.py"
+    if [ ! -f "$ENV_FILE" ]; then
+        echo "  ❌ Environment file missing: $ENV_FILE"
         all_tests_passed=false
+    else
+        local metadata
+        metadata=$(stat -c '%U:%G %a' "$ENV_FILE")
+        if [ "$metadata" != "root:root 600" ]; then
+            echo "  ❌ Environment file metadata is $metadata; expected root:root 600"
+            all_tests_passed=false
+        fi
+        local variable_name
+        for variable_name in \
+            TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID TELEGRAM_AUTHORIZED_USER_ID \
+            DISCORD_BOT_TOKEN DISCORD_APPLICATION_ID DISCORD_GUILD_ID \
+            DISCORD_CHANNEL_ID DISCORD_AUTHORIZED_USER_ID
+        do
+            if ! grep -q "^${variable_name}=." "$ENV_FILE"; then
+                echo "  ❌ Missing required variable name: $variable_name"
+                all_tests_passed=false
+            fi
+        done
+        if sudo -u "$APP_USER" test -r "$ENV_FILE"; then
+            echo "  ❌ $ENV_FILE is readable by $APP_USER"
+            all_tests_passed=false
+        fi
     fi
 
     # Test 6: Log files
@@ -572,23 +605,15 @@ else:
     print_status "Test 6: Log Files"
     if [ -d "$LOG_DIR" ]; then
         echo "  ✅ Log directory exists: $LOG_DIR"
-        if [ -f "$LOG_DIR/monitor.log" ] && [ -f "$LOG_DIR/bot.log" ]; then
-            echo "  ✅ Both log files exist (monitor.log, bot.log)"
-            echo "  Last 3 lines of monitor.log:"
-            tail -n 3 "$LOG_DIR/monitor.log" | sed 's/^/     /'
-            echo "  Last 3 lines of bot.log:"
-            tail -n 3 "$LOG_DIR/bot.log" | sed 's/^/     /'
-        elif [ -f "$LOG_DIR/monitor.log" ] || [ -f "$LOG_DIR/bot.log" ]; then
-            echo "  ⚠️  Partial log files found (normal if only one service has started)"
-            if [ -f "$LOG_DIR/monitor.log" ]; then
-                echo "    - monitor.log exists"
+        local log_name
+        for log_name in monitor.log notifier.log telegram.log discord.log; do
+            if [ -f "$LOG_DIR/$log_name" ]; then
+                echo "  ✅ $log_name exists"
+            else
+                echo "  ❌ $log_name is missing"
+                all_tests_passed=false
             fi
-            if [ -f "$LOG_DIR/bot.log" ]; then
-                echo "    - bot.log exists"
-            fi
-        else
-            echo "  ⚠️  Log files not yet created (normal if services haven't started)"
-        fi
+        done
     else
         echo "  ❌ Log directory not found"
         all_tests_passed=false
@@ -624,6 +649,7 @@ else:
     echo
     if $all_tests_passed; then
         print_status "✅ All tests passed! System is ready."
+        return 0
     else
         print_warning "⚠️  Some tests failed. Review output above."
         echo
@@ -631,7 +657,8 @@ else:
         echo "  - Missing venv: Run setup-service.sh"
         echo "  - Missing config: Copy config.py.example and configure"
         echo "  - Service not set up: Run setup-service.sh"
-        echo "  - Wrong permissions: sudo chown -R $APP_USER:$APP_USER $APP_DIR"
+        echo "  - Wrong runtime permissions: rerun setup-service.sh"
+        return 1
     fi
 }
 
@@ -687,7 +714,7 @@ show_help() {
     echo
     echo "Log options:"
     echo "  -f, --follow         Follow logs in real-time"
-    echo "  -t, --type TYPE      Log type: service, python, file, error, all (default: service)"
+    echo "  -t, --type TYPE      Log type: service, systemd, monitor, notifier, bot, discord, error"
     echo "  -n, --lines N        Number of lines to show (default: $LOG_LINES)"
     echo
     echo "Monitor types:"

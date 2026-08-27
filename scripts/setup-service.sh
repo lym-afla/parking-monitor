@@ -2,13 +2,17 @@
 # Service Setup Script for Parking Monitor
 # Creates user, sets permissions, creates symlink, and configures systemd services
 
+set -euo pipefail
+
 # Configuration
 SERVICE_NAME="parking-service"
 APP_DIR="/opt/parking_monitor"
+VENV_DIR="${APP_DIR}/venv"
 LOG_DIR="/opt/parking_monitor/logs"
 APP_USER="parking_user"
 SYMLINK_PATH="/usr/local/bin/parking-monitor"
 CONFIG_DIR="/opt/parking_monitor/config"
+SYSTEMD_DIR="/etc/systemd/system"
 
 # Colors for output
 RED='\033[0;31m'
@@ -59,7 +63,7 @@ detect_and_configure_user() {
     fi
 
     # Try to detect the actual user who ran sudo
-    if [ -n "$SUDO_USER" ] && id "$SUDO_USER" &>/dev/null; then
+    if [ -n "${SUDO_USER:-}" ] && id "$SUDO_USER" &>/dev/null; then
         print_status "Detected user who ran sudo: $SUDO_USER"
         echo "Choose user configuration:"
         echo "1) Create dedicated 'parking_user' (recommended for production)"
@@ -90,14 +94,13 @@ create_parking_user() {
     print_status "Creating dedicated 'parking_user'..."
 
     # Create system user with home directory
-    useradd --system --create-home --home-dir "/home/parking_user" --shell /bin/bash "parking_user" 2>/dev/null || {
-        print_warning "User parking_user already exists"
-    }
+    useradd --system --create-home --home-dir "/home/parking_user" --shell /bin/bash "parking_user"
     APP_USER="parking_user"
     print_status "User $APP_USER configured"
 
     # Add user to necessary groups
-    usermod -aG systemd-journal "$APP_USER" 2>/dev/null || true
+    usermod -aG systemd-journal "$APP_USER" 2>/dev/null || \
+        print_warning "Could not add $APP_USER to systemd-journal"
     print_status "User permissions configured"
 }
 
@@ -115,26 +118,34 @@ setup_permissions() {
     mkdir -p "$LOG_DIR"
     mkdir -p "$CONFIG_DIR"
 
-    # Change ownership to app user
-    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
-    chown -R "$APP_USER:$APP_USER" "$LOG_DIR"
-    chown -R "$APP_USER:$APP_USER" "$CONFIG_DIR"
-    print_status "Directory ownership set to $APP_USER"
+    # Own only runtime boundaries and their existing runtime files. Never
+    # recurse through the repository or virtual environment: doing so destroys
+    # executable modes in venv/bin and Playwright's installed helpers.
+    chown "$APP_USER:$APP_USER" "$APP_DIR" "$LOG_DIR" "$CONFIG_DIR"
+    chmod 0755 "$APP_DIR" "$LOG_DIR"
+    chmod 0700 "$CONFIG_DIR"
 
-    # Set proper permissions
-    find "$APP_DIR" -type d -exec chmod 755 {} \; 2>/dev/null || true
-    find "$APP_DIR" -type f -exec chmod 644 {} \; 2>/dev/null || true
+    local runtime_path
+    for runtime_path in \
+        "$APP_DIR/state.json" \
+        "$APP_DIR/notifications.sqlite3" \
+        "$APP_DIR/notifications.sqlite3-wal" \
+        "$APP_DIR/notifications.sqlite3-shm"
+    do
+        if [ -e "$runtime_path" ]; then
+            chown "$APP_USER:$APP_USER" "$runtime_path"
+            chmod 0600 "$runtime_path"
+        fi
+    done
 
-    # Make scripts executable
-    chmod +x "$APP_DIR/scripts/"*.sh 2>/dev/null || true
-    chmod +x "$APP_DIR/"*.py 2>/dev/null || true
-
-    # Ensure management script is executable
-    chmod +x "$APP_DIR/scripts/manage-parking-monitor.sh"
+    local script_path
+    for script_path in "$APP_DIR"/scripts/*.sh; do
+        if [ -f "$script_path" ]; then
+            chmod 0755 "$script_path"
+        fi
+    done
 
     # Runtime secrets live outside the application tree and are never changed here.
-    chmod 700 "$CONFIG_DIR" 2>/dev/null || true
-
     # Configure git for server deployment
     if [ -d "$APP_DIR/.git" ]; then
         print_status "Configuring git for server deployment..."
@@ -143,11 +154,10 @@ setup_permissions() {
             git config core.filemode false
             git config core.autocrlf false
             git config --global --add safe.directory '$APP_DIR'
-            git checkout -- . 2>/dev/null || true
         "
 
         # Also add safe.directory for root user
-        git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
+        git config --global --add safe.directory "$APP_DIR"
 
         print_status "Git configuration completed"
     fi
@@ -227,8 +237,8 @@ render_service_files() {
 # Create systemd service files.
 create_service_file() {
     print_header "Creating systemd service files..."
-    render_service_files "/etc/systemd/system"
-    chmod 0644 "/etc/systemd/system/${SERVICE_NAME}-"*.service
+    render_service_files "$SYSTEMD_DIR"
+    chmod 0644 "$SYSTEMD_DIR/${SERVICE_NAME}-"*.service
 
     print_status "Service files created:"
     print_status "  - ${SERVICE_NAME}-monitor.service (web scraper)"
@@ -236,8 +246,26 @@ create_service_file() {
     print_status "  - ${SERVICE_NAME}-bot.service (private Telegram bot)"
     print_status "  - ${SERVICE_NAME}-discord.service (private Discord bot)"
 
+    remove_legacy_aggregate_service
     systemctl daemon-reload
     print_status "Systemd configuration reloaded"
+}
+
+# Retire the former aggregate oneshot unit during upgrades. Stopping and
+# disabling precede removal so a reboot cannot resurrect stale orchestration.
+remove_legacy_aggregate_service() {
+    local legacy_unit="${SERVICE_NAME}.service"
+    local legacy_path="${SYSTEMD_DIR}/${legacy_unit}"
+
+    if [ ! -e "$legacy_path" ]; then
+        return 0
+    fi
+    if systemctl is-active --quiet "$legacy_unit"; then
+        systemctl stop "$legacy_unit"
+    fi
+    systemctl disable "$legacy_unit"
+    rm -f -- "$legacy_path"
+    print_status "Removed obsolete ${legacy_unit}"
 }
 
 # Create symlink for management script
@@ -370,8 +398,8 @@ validate_environment() {
     fi
 
     # Check if virtual environment exists
-    if [ ! -f "$APP_DIR/venv/bin/python" ]; then
-        print_warning "Virtual environment not found at $APP_DIR/venv"
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+        print_warning "Virtual environment not found at $VENV_DIR"
         print_status "Make sure you've deployed the parking monitor first"
         print_status "Run setup script to create venv and install dependencies"
     else
@@ -393,13 +421,11 @@ validate_environment() {
 install_dependencies() {
     print_header "Installing Python dependencies..."
 
-    if [ ! -d "$APP_DIR/venv" ]; then
+    if [ ! -d "$VENV_DIR" ]; then
         print_status "Creating virtual environment..."
-        python3 -m venv "$APP_DIR/venv"
+        sudo -u "$APP_USER" python3 -m venv "$VENV_DIR"
         print_status "Virtual environment created"
     fi
-
-    source "$APP_DIR/venv/bin/activate"
 
     # Install system dependencies for Playwright
     if ! command -v npx &> /dev/null; then
@@ -410,19 +436,18 @@ install_dependencies() {
 
     # Install Python dependencies
     if [ -f "$APP_DIR/requirements.txt" ]; then
-        pip install --upgrade pip --quiet
-        pip install -r "$APP_DIR/requirements.txt" --quiet
+        sudo -u "$APP_USER" "$VENV_DIR/bin/python" -m pip install --upgrade pip --quiet
+        sudo -u "$APP_USER" "$VENV_DIR/bin/python" -m pip install -r "$APP_DIR/requirements.txt" --quiet
         print_status "Python dependencies installed"
     else
-        print_warning "requirements.txt not found, installing minimal dependencies..."
-        pip install --upgrade pip --quiet
-        pip install python-telegram-bot playwright --quiet
+        print_error "requirements.txt not found at $APP_DIR/requirements.txt"
+        return 1
     fi
 
     # Install Playwright browsers
     print_status "Installing Playwright browsers..."
-    python -m playwright install chromium
-    python -m playwright install-deps chromium
+    sudo -u "$APP_USER" "$VENV_DIR/bin/python" -m playwright install chromium
+    "$VENV_DIR/bin/python" -m playwright install-deps chromium
 
     print_status "Dependencies installed successfully"
 }
@@ -446,6 +471,14 @@ main() {
     print_header "Setup completed successfully!"
 }
 
+install_units_only() {
+    check_root
+    create_service_file
+    create_symlink
+    enable_service
+    print_header "Systemd units installed successfully"
+}
+
 # Show help
 show_help() {
     echo "Parking Monitor Service Setup Script"
@@ -457,6 +490,7 @@ show_help() {
     echo "  - Management script symlink (parking-monitor command)"
     echo
     echo "Usage: sudo $0"
+    echo "       sudo $0 --install-units"
     echo "       $0 --render-only OUTPUT_DIRECTORY"
     echo
     echo "After running this script, you can manage the service with:"
@@ -479,6 +513,13 @@ case "${1:-setup}" in
             exit 2
         fi
         render_service_files "$2"
+        ;;
+    --install-units)
+        if [ "$#" -ne 1 ]; then
+            print_error "--install-units does not accept arguments"
+            exit 2
+        fi
+        install_units_only
         ;;
     *)
         print_error "Unknown command: $1"

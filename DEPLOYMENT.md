@@ -81,7 +81,16 @@ PREVIOUS_REVISION=$(git rev-parse HEAD)
 printf 'previous revision: %s\n' "$PREVIOUS_REVISION"
 UNIT_BACKUP="/var/backups/parking-monitor-units-$(date -u +%Y%m%dT%H%M%SZ)"
 sudo install -d -m 700 "$UNIT_BACKUP"
-sudo cp -a /etc/systemd/system/parking-service-*.service "$UNIT_BACKUP"/
+sudo cp -a /etc/systemd/system/parking-service.service "$UNIT_BACKUP"/ 2>/dev/null || true
+sudo cp -a /etc/systemd/system/parking-service-*.service "$UNIT_BACKUP"/ 2>/dev/null || true
+for unit in \
+  parking-service.service parking-service-monitor parking-service-notifier \
+  parking-service-bot parking-service-discord
+do
+  state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+  printf '%s %s\n' "$unit" "${state:-not-found}" | \
+    sudo tee -a "$UNIT_BACKUP/enablement.txt" >/dev/null
+done
 printf 'unit backup: %s\n' "$UNIT_BACKUP"
 sudo systemctl show \
   parking-service-monitor parking-service-notifier \
@@ -262,12 +271,15 @@ Do not simulate parking availability by editing `state.json`, toggling
 
 ## Credential-leak audit
 
-Before sign-off, a root-only operator must scan the four service journals and
-`notification_deliveries.last_error` for the full current token values and
-stable token fragments. The scanner must print only a match count and location
-category, never the fragment or matching line. A non-zero count blocks
-deployment. Also confirm no authorization headers, token-bearing request URLs,
-or environment values appear in the captured logs.
+Before sign-off, a root-only operator must scan the four append files
+`logs/monitor.log`, `logs/notifier.log`, `logs/telegram.log`, and
+`logs/discord.log`, plus `notification_deliveries.last_error`, for the full
+current token values and stable token fragments. The scanner must print only a
+match count and location category, never the fragment or matching line. A
+non-zero count blocks deployment. Also confirm no authorization headers,
+token-bearing request URLs, or environment values appear in those append files.
+Use `sudo parking-monitor logs -t systemd` only for unit lifecycle diagnostics;
+application authentication errors are in the append files.
 
 Record the final revision and service timestamps:
 
@@ -306,18 +318,43 @@ sudo cp -a state.json notifications.sqlite3 "$ROLLBACK_BACKUP"/
 for file in notifications.sqlite3-wal notifications.sqlite3-shm; do
   if [ -e "$file" ]; then sudo cp -a "$file" "$ROLLBACK_BACKUP"/; fi
 done
-sudo systemctl stop parking-service-notifier parking-service-discord
+sudo systemctl disable --now parking-service-notifier parking-service-discord
 git switch --detach "$PREVIOUS_REVISION"
-sudo cp -a "$UNIT_BACKUP"/parking-service-*.service /etc/systemd/system/
+sudo rm -f \
+  /etc/systemd/system/parking-service.service \
+  /etc/systemd/system/parking-service-monitor.service \
+  /etc/systemd/system/parking-service-notifier.service \
+  /etc/systemd/system/parking-service-bot.service \
+  /etc/systemd/system/parking-service-discord.service
+sudo find "$UNIT_BACKUP" -maxdepth 1 -name '*.service' \
+  -exec cp -a -t /etc/systemd/system/ {} +
 sudo systemctl daemon-reload
+while read -r unit state; do
+  case "$unit" in
+    parking-service-notifier|parking-service-discord)
+      continue
+      ;;
+  esac
+  case "$state" in
+    enabled|enabled-runtime|linked|linked-runtime)
+      sudo systemctl enable "$unit"
+      ;;
+    disabled)
+      sudo systemctl disable "$unit"
+      ;;
+    masked|masked-runtime)
+      sudo systemctl mask "$unit"
+      ;;
+  esac
+done < <(sudo cat "$UNIT_BACKUP/enablement.txt")
 sudo systemctl restart parking-service-bot parking-service-monitor
 sudo systemctl status parking-service-bot parking-service-monitor --no-pager
 ```
 
-If the recorded revision contains different unit definitions, reinstall those
-reviewed unit files before `daemon-reload`; do not blindly start the new notifier
-or Discord units. Report the exact gate that failed and the recorded revisions
-and timestamps.
+The new notifier and Discord units remain disabled throughout rollback so a
+reboot cannot resurrect them. The recorded unit files and enablement are
+restored for the aggregate, monitor, and Telegram units where they existed.
+Report the exact gate that failed and the recorded revisions and timestamps.
 
 Never delete or overwrite `notifications.sqlite3`, its WAL files, `state.json`,
 the rollback backup, or `/etc/parking-monitor.env` during rollback.

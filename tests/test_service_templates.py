@@ -118,13 +118,22 @@ class ServiceTemplateTests(unittest.TestCase):
 
 
 class ServiceManagementTests(unittest.TestCase):
-    def _run_sourced_command(self, shell_body: str) -> list[str]:
+    def _run_sourced_script(
+        self,
+        script: Path,
+        shell_body: str,
+        *,
+        extra_environment: dict[str, str] | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         with tempfile.TemporaryDirectory() as temporary_directory:
             call_log = Path(temporary_directory) / "calls.log"
             environment = os.environ.copy()
             environment["CALL_LOG"] = _bash_path(call_log)
+            environment["TEST_ROOT"] = _bash_path(Path(temporary_directory))
+            if extra_environment:
+                environment.update(extra_environment)
             source_command = (
-                f"source '{_bash_path(MANAGEMENT_SCRIPT)}' help >/dev/null\n"
+                f"source '{_bash_path(script)}' help >/dev/null\n"
                 f"{shell_body}"
             )
             result = subprocess.run(
@@ -135,8 +144,17 @@ class ServiceManagementTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            return call_log.read_text(encoding="utf-8").splitlines()
+            calls = (
+                call_log.read_text(encoding="utf-8").splitlines()
+                if call_log.exists()
+                else []
+            )
+            return result, calls
+
+    def _run_sourced_command(self, shell_body: str) -> list[str]:
+        result, calls = self._run_sourced_script(MANAGEMENT_SCRIPT, shell_body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return calls
 
     def test_stop_manages_all_four_services(self):
         calls = self._run_sourced_command(
@@ -151,17 +169,149 @@ stop_service >/dev/null
         stopped = {line.removeprefix("stop ") for line in calls if line.startswith("stop ")}
         self.assertEqual(stopped, set(SERVICE_NAMES))
 
-    def test_service_logs_include_all_four_services(self):
-        calls = self._run_sourced_command(
+    def test_default_logs_read_all_four_dedicated_append_files(self):
+        result, calls = self._run_sourced_script(
+            MANAGEMENT_SCRIPT,
             """
 check_root_for_command() { :; }
-journalctl() { printf '%s\\n' "$*" >> "$CALL_LOG"; return 0; }
+LOG_DIR="$TEST_ROOT/logs"
+mkdir -p "$LOG_DIR"
+touch "$LOG_DIR/monitor.log" "$LOG_DIR/notifier.log" \\
+      "$LOG_DIR/telegram.log" "$LOG_DIR/discord.log"
+tail() { printf 'tail %s\\n' "$*" >> "$CALL_LOG"; return 0; }
+journalctl() { printf 'journalctl %s\\n' "$*" >> "$CALL_LOG"; return 0; }
 show_logs -t service >/dev/null
 """
         )
+        self.assertEqual(result.returncode, 0, result.stderr)
         logged_text = "\n".join(calls)
+        for log_name in ("monitor.log", "notifier.log", "telegram.log", "discord.log"):
+            self.assertIn(log_name, logged_text)
+        self.assertNotIn("journalctl ", logged_text)
+
+    def test_component_logs_read_the_component_append_file(self):
+        expected = {
+            "monitor": "monitor.log",
+            "notifier": "notifier.log",
+            "bot": "telegram.log",
+            "discord": "discord.log",
+        }
+        for component, log_name in expected.items():
+            with self.subTest(component=component):
+                result, calls = self._run_sourced_script(
+                    MANAGEMENT_SCRIPT,
+                    f"""
+check_root_for_command() {{ :; }}
+LOG_DIR="$TEST_ROOT/logs"
+mkdir -p "$LOG_DIR"
+touch "$LOG_DIR/{log_name}"
+tail() {{ printf 'tail %s\\n' "$*" >> "$CALL_LOG"; return 0; }}
+journalctl() {{ printf 'journalctl %s\\n' "$*" >> "$CALL_LOG"; return 0; }}
+show_logs -t {component} >/dev/null
+""",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                logged_text = "\n".join(calls)
+                self.assertIn(log_name, logged_text)
+                self.assertNotIn("journalctl ", logged_text)
+
+    def test_setup_permission_scope_never_recurses_over_venv(self):
+        result, calls = self._run_sourced_script(
+            SETUP_SCRIPT,
+            """
+APP_DIR="$TEST_ROOT/app"
+VENV_DIR="$APP_DIR/venv"
+LOG_DIR="$APP_DIR/logs"
+CONFIG_DIR="$APP_DIR/config"
+APP_USER=parking_user
+mkdir -p "$VENV_DIR/bin" "$APP_DIR/scripts"
+touch "$VENV_DIR/bin/pip" "$APP_DIR/scripts/manage-parking-monitor.sh"
+chown() { printf 'chown %s\\n' "$*" >> "$CALL_LOG"; return 0; }
+chmod() { printf 'chmod %s\\n' "$*" >> "$CALL_LOG"; return 0; }
+find() { printf 'find %s\\n' "$*" >> "$CALL_LOG"; return 0; }
+setup_permissions >/dev/null
+""",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        command_text = "\n".join(calls)
+        self.assertNotIn("chown -R parking_user:parking_user", command_text)
+        for line in calls:
+            self.assertNotIn("/venv", line)
+
+    def test_setup_stops_on_stage_failure_without_false_success(self):
+        result, _ = self._run_sourced_script(
+            SETUP_SCRIPT,
+            """
+check_root() { :; }
+validate_environment() { :; }
+detect_and_configure_user() { :; }
+setup_permissions() { :; }
+install_dependencies() { :; }
+create_service_file() { return 23; }
+create_symlink() { printf 'symlink-called\\n'; }
+enable_service() { printf 'enable-called\\n'; }
+show_summary() { printf 'summary-called\\n'; }
+main
+""",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Setup completed successfully", result.stdout)
+        self.assertNotIn("symlink-called", result.stdout)
+
+    def test_setup_removes_obsolete_aggregate_after_stop_and_disable(self):
+        result, calls = self._run_sourced_script(
+            SETUP_SCRIPT,
+            """
+SYSTEMD_DIR="$TEST_ROOT/systemd"
+mkdir -p "$SYSTEMD_DIR"
+touch "$SYSTEMD_DIR/parking-service.service"
+systemctl() {
+    printf '%s\\n' "$*" >> "$CALL_LOG"
+    if [ "$1" = is-active ]; then return 0; fi
+    return 0
+}
+remove_legacy_aggregate_service
+test ! -e "$SYSTEMD_DIR/parking-service.service"
+""",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stop parking-service.service", calls)
+        self.assertIn("disable parking-service.service", calls)
+
+    def test_update_helpers_stop_and_restore_every_active_service(self):
+        calls = self._run_sourced_command(
+            """
+check_service_exists() { :; }
+systemctl() {
+    printf '%s\\n' "$*" >> "$CALL_LOG"
+    return 0
+}
+capture_and_stop_running_services
+restore_running_services
+"""
+        )
         for service_name in SERVICE_NAMES:
-            self.assertIn(f"-u {service_name}", logged_text)
+            self.assertIn(f"stop {service_name}", calls)
+            self.assertIn(f"start {service_name}", calls)
+
+    def test_service_test_helper_fails_when_any_current_service_is_inactive(self):
+        result, calls = self._run_sourced_script(
+            MANAGEMENT_SCRIPT,
+            """
+systemctl() {
+    printf '%s\\n' "$*" >> "$CALL_LOG"
+    if [ "$1" = is-active ] && [ "$3" = parking-service-discord ]; then
+        return 1
+    fi
+    return 0
+}
+test_service_units
+""",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        called_text = "\n".join(calls)
+        for service_name in SERVICE_NAMES:
+            self.assertIn(service_name, called_text)
 
 
 if __name__ == "__main__":
