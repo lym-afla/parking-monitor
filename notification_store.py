@@ -1,10 +1,8 @@
 """Durable SQLite-backed notification event and delivery state."""
 
 import json
-import os
 import re
 import sqlite3
-import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -12,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from command_service import ChannelHealth
+from state_store import mutate_json_state
 
 
 SUPPORTED_CHANNELS = ("telegram", "discord")
@@ -59,6 +58,10 @@ class NotificationStore:
         self._secrets = tuple(secret for secret in secrets if secret)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
+
+    def sanitize(self, error: object) -> str:
+        """Sanitize an error with this store's runtime redaction values."""
+        return sanitize_error(error, secrets=self._secrets)
 
     def create_event(
         self,
@@ -140,6 +143,8 @@ class NotificationStore:
                     e.source_check
                 FROM notification_deliveries AS d
                 JOIN notification_events AS e ON e.id = d.event_id
+                JOIN notification_channels AS c
+                  ON c.channel = d.channel AND c.enabled = 1
                 WHERE d.channel = ?
                   AND (
                     (
@@ -288,6 +293,60 @@ class NotificationStore:
             ),
         )
 
+    def requeue_failed(self, channel: str, now: datetime) -> int:
+        """Make terminal failures for one corrected channel immediately retryable."""
+        self._validate_channel(channel)
+        now_iso = _utc_iso(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE notification_deliveries
+                SET status = 'retry',
+                    next_attempt_at = ?,
+                    last_error = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL,
+                    claimed_from_status = NULL
+                WHERE channel = ? AND status = 'failed'
+                """,
+                (now_iso, channel),
+            )
+            connection.commit()
+            return int(cursor.rowcount)
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def set_channel_enabled(
+        self, channel: str, enabled: bool, now: datetime
+    ) -> None:
+        """Persist whether one independently configured channel is enabled."""
+        self._validate_channel(channel)
+        now_iso = _utc_iso(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO notification_channels (channel, enabled, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(channel) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (channel, int(bool(enabled)), now_iso),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def health_summary(self) -> dict[str, ChannelHealth]:
         """Return delivery counts and latest success for both known channels."""
         connection = self._connect()
@@ -295,75 +354,78 @@ class NotificationStore:
             rows = connection.execute(
                 """
                 SELECT
-                    channel,
-                    MAX(delivered_at) AS last_delivered_at,
+                    c.channel,
+                    c.enabled,
+                    MAX(d.delivered_at) AS last_delivered_at,
+                    SUM(CASE WHEN d.status = 'delivered' THEN 1 ELSE 0 END)
+                        AS delivered_count,
                     SUM(CASE
-                        WHEN status = 'pending'
-                          OR (status = 'claimed' AND claimed_from_status = 'pending')
+                        WHEN d.status = 'pending'
+                          OR (d.status = 'claimed' AND d.claimed_from_status = 'pending')
                         THEN 1 ELSE 0 END) AS pending_count,
                     SUM(CASE
-                        WHEN status = 'retry'
-                          OR (status = 'claimed' AND claimed_from_status = 'retry')
+                        WHEN d.status = 'retry'
+                          OR (d.status = 'claimed' AND d.claimed_from_status = 'retry')
                         THEN 1 ELSE 0 END) AS retrying_count,
-                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)
+                    SUM(CASE WHEN d.status = 'failed' THEN 1 ELSE 0 END)
                         AS failed_count
-                FROM notification_deliveries
-                GROUP BY channel
+                FROM notification_channels AS c
+                LEFT JOIN notification_deliveries AS d ON d.channel = c.channel
+                GROUP BY c.channel, c.enabled
                 """
             ).fetchall()
         finally:
             connection.close()
 
         by_channel = {row["channel"]: row for row in rows}
-        return {
-            channel: ChannelHealth(
-                last_delivered_at=(
-                    by_channel[channel]["last_delivered_at"]
-                    if channel in by_channel
-                    else None
-                ),
-                pending_count=(
-                    int(by_channel[channel]["pending_count"])
-                    if channel in by_channel
-                    else 0
-                ),
-                retrying_count=(
-                    int(by_channel[channel]["retrying_count"])
-                    if channel in by_channel
-                    else 0
-                ),
-                failed_count=(
-                    int(by_channel[channel]["failed_count"])
-                    if channel in by_channel
-                    else 0
-                ),
+        summary = {}
+        for channel in SUPPORTED_CHANNELS:
+            row = by_channel[channel]
+            delivered_count = int(row["delivered_count"] or 0)
+            pending_count = int(row["pending_count"] or 0)
+            retrying_count = int(row["retrying_count"] or 0)
+            failed_count = int(row["failed_count"] or 0)
+            if not bool(row["enabled"]):
+                state = "disabled"
+            elif failed_count:
+                state = "failed"
+            elif retrying_count:
+                state = "retrying"
+            elif pending_count:
+                state = "pending"
+            else:
+                state = "healthy"
+            summary[channel] = ChannelHealth(
+                state=state,
+                last_delivered_at=row["last_delivered_at"],
+                delivered_count=delivered_count,
+                pending_count=pending_count,
+                retrying_count=retrying_count,
+                failed_count=failed_count,
             )
-            for channel in SUPPORTED_CHANNELS
-        }
+        return summary
 
     def migrate_legacy_alert(self, state_path: str | Path) -> int | None:
         """Move a legacy Boolean alert into one idempotent durable event."""
         state_path = Path(state_path)
-        try:
-            with state_path.open("r", encoding="utf-8") as state_file:
-                state = json.load(state_file)
-        except FileNotFoundError:
-            return None
-        if not isinstance(state, dict):
-            raise ValueError("State file must contain a JSON object")
-        if state.get("alert") is not True:
+        if not state_path.exists():
             return None
 
-        last_check = state.get("last_check")
-        event_id = self.create_event(
-            "parking_available",
-            {"legacy": True, "last_check": last_check},
-            int(state.get("checks", 0)),
-            SUPPORTED_CHANNELS,
-            event_key=f"legacy-alert:{last_check}",
-        )
-        state["alert"] = False
-        _atomic_write_json(state_path, state)
+        def migrate(state):
+            if state.get("alert") is not True:
+                return None
+            last_check = state.get("last_check")
+            event_id = self.create_event(
+                "parking_available",
+                {"legacy": True, "last_check": last_check},
+                int(state.get("checks", 0)),
+                SUPPORTED_CHANNELS,
+                event_key=f"legacy-alert:{last_check}",
+            )
+            state["alert"] = False
+            return event_id
+
+        _, event_id = mutate_json_state(state_path, migrate)
         return event_id
 
     def deliveries_for(self, event_id: int) -> list[DeliveryRecord]:
@@ -441,6 +503,12 @@ class NotificationStore:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS notification_channels (
+                    channel TEXT PRIMARY KEY CHECK (channel IN ('telegram', 'discord')),
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS notification_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_key TEXT UNIQUE,
@@ -478,6 +546,16 @@ class NotificationStore:
                     );
                 """
             )
+            initialized_at = _utc_iso(datetime.now(timezone.utc))
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO notification_channels (
+                    channel, enabled, updated_at
+                ) VALUES (?, 1, ?)
+                """,
+                [(channel, initialized_at) for channel in SUPPORTED_CHANNELS],
+            )
+            connection.commit()
         finally:
             connection.close()
 
@@ -535,21 +613,3 @@ def sanitize_error(error: object, secrets: Iterable[str] = ()) -> str:
     text = re.sub(r"https?://[^\s]+", "[redacted-url]", text, flags=re.IGNORECASE)
     text = " ".join(text.split())
     return text[:MAX_STORED_ERROR_LENGTH]
-
-
-def _atomic_write_json(path: Path, state: Mapping[str, Any]) -> None:
-    file_descriptor, temporary_path = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    try:
-        with os.fdopen(file_descriptor, "w", encoding="utf-8") as state_file:
-            json.dump(state, state_file, ensure_ascii=False)
-            state_file.flush()
-            os.fsync(state_file.fileno())
-        os.replace(temporary_path, path)
-    except BaseException:
-        try:
-            os.unlink(temporary_path)
-        except FileNotFoundError:
-            pass
-        raise

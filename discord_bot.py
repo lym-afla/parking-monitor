@@ -9,16 +9,25 @@ from discord import app_commands
 from discord.ext import commands
 
 from command_service import ChannelHealth, CommandService, StatsSnapshot, StatusSnapshot
-from config import STATE_FILE, RuntimeConfig, load_config
+from config import (
+    STATE_FILE,
+    DATABASE_FILE,
+    DiscordCommandConfig,
+    RuntimeConfig,
+    load_discord_command_config,
+)
 from notification_store import NotificationStore
 
 
 LOGGER = logging.getLogger("parking_discord_bot")
-DATABASE_PATH = Path(__file__).with_name("notifications.sqlite3")
+DATABASE_PATH = Path(DATABASE_FILE)
 GENERIC_FAILURE_MESSAGE = "Unable to complete this request right now."
 
 
-def is_authorized(interaction: discord.Interaction, config: RuntimeConfig) -> bool:
+def is_authorized(
+    interaction: discord.Interaction,
+    config: RuntimeConfig | DiscordCommandConfig,
+) -> bool:
     """Return whether an interaction matches every configured Discord boundary."""
     user = getattr(interaction, "user", None)
     return bool(
@@ -50,7 +59,9 @@ def format_interval(seconds: int) -> str:
 
 def _health_line(channel: str, health: ChannelHealth) -> str:
     return (
-        f"{channel.title()}: last {health.last_delivered_at or 'Never'}; "
+        f"{channel.title()}: {health.state}; "
+        f"last {health.last_delivered_at or 'Never'}; "
+        f"delivered {health.delivered_count}, "
         f"pending {health.pending_count}, retrying {health.retrying_count}, "
         f"failed {health.failed_count}"
     )
@@ -71,6 +82,7 @@ def format_status_message(status: StatusSnapshot) -> str:
         "**Parking Monitor Status**\n\n"
         f"Current Status: {availability}\n"
         f"Last Check: {status.last_check or 'Never'}\n"
+        f"Next Expected Check: {status.next_expected_check or 'Unknown'}\n"
         f"Polling Mode: {status.polling_mode}\n"
         f"Active Interval: {format_interval(status.effective_interval_seconds)}\n"
         f"Normal Interval: {format_interval(status.normal_interval_seconds)}\n\n"
@@ -92,7 +104,11 @@ def format_stats_message(stats: StatsSnapshot) -> str:
 class DiscordCommands:
     """Authorized Discord handlers backed by the shared command service."""
 
-    def __init__(self, command_service: CommandService, config: RuntimeConfig):
+    def __init__(
+        self,
+        command_service: CommandService,
+        config: RuntimeConfig | DiscordCommandConfig,
+    ):
         self._command_service = command_service
         self._config = config
 
@@ -225,7 +241,11 @@ class ParkingControlsView(discord.ui.View):
 class ParkingDiscordBot(commands.Bot):
     """Discord client with only guild discovery and one guild command tree."""
 
-    def __init__(self, config: RuntimeConfig, command_service: CommandService):
+    def __init__(
+        self,
+        config: RuntimeConfig | DiscordCommandConfig,
+        command_service: CommandService,
+    ):
         intents = discord.Intents.none()
         intents.guilds = True
         super().__init__(
@@ -259,23 +279,39 @@ class ParkingDiscordBot(commands.Bot):
         await self.tree.sync(guild=self._command_guild)
 
 
-def build_bot(config: RuntimeConfig, command_service: CommandService) -> ParkingDiscordBot:
+def build_bot(
+    config: RuntimeConfig | DiscordCommandConfig,
+    command_service: CommandService,
+) -> ParkingDiscordBot:
     return ParkingDiscordBot(config, command_service)
 
 
-def main() -> None:
+def main() -> int:
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("discord.http").setLevel(logging.ERROR)
-    config = load_config()
-    store = NotificationStore(
-        DATABASE_PATH,
-        secrets=(config.telegram_bot_token, config.discord_bot_token),
-    )
-    command_service = CommandService(STATE_FILE, health_provider=store.health_summary)
-    bot = build_bot(config, command_service)
-    LOGGER.info("Discord bot starting")
-    bot.run(config.discord_bot_token, log_handler=None)
+    try:
+        config = load_discord_command_config()
+        if config is None:
+            LOGGER.warning("Discord command service disabled: configuration absent")
+            return 0
+        store = NotificationStore(
+            DATABASE_PATH,
+            secrets=(config.discord_bot_token,),
+        )
+        command_service = CommandService(
+            STATE_FILE, health_provider=store.health_summary
+        )
+        bot = build_bot(config, command_service)
+        LOGGER.info("Discord bot starting")
+        bot.run(config.discord_bot_token, log_handler=None)
+        return 0
+    except Exception as exc:
+        LOGGER.error(
+            "Discord startup failed error_class=%s",
+            type(exc).__name__,
+        )
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

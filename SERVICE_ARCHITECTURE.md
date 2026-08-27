@@ -1,330 +1,106 @@
-# Parking Monitor - Service Architecture
+# Service architecture
 
-This document explains how the Parking Monitor system is structured and runs as services on Ubuntu.
+## Process and privilege map
 
-## Architecture Overview
+| Unit | Identity | Credentials | Mutable access |
+|---|---|---|---|
+| `parking-service-monitor` | `parking-monitor-monitor` | none | shared state and SQLite |
+| `parking-service-notifier` | `parking-monitor-notifier` | Telegram/Discord delivery-only files | shared SQLite/state migration |
+| `parking-service-bot` | `parking-monitor-telegram` | Telegram command file only | interval state and SQLite health |
+| `parking-service-discord` | `parking-monitor-discord` | Discord command file only | interval state and SQLite health |
 
-The Parking Monitor uses a **dual-service architecture** with two separate processes that communicate through a shared state file:
+Every identity has primary group `parking-monitor`, a nonexistent home, and
+`/usr/sbin/nologin`. Distinct UIDs prevent sibling environment inspection. The
+group grants write access only to `/var/lib/parking-monitor/data`.
 
-```
-┌─────────────────────┐    ┌─────────────────┐    ┌─────────────────────┐
-│                     │    │                 │    │                     │
-│  monitor.py         │───▶│  state.json     │◀───│  telegram_bot.py    │
-│  (Web Scraper)      │    │  (State File)   │    │  (Telegram Bot)     │
-│                     │    │                 │    │                     │
-│ • Scrapes website  │    │ • last_check    │    │ • Sends alerts      │
-│ • Updates state     │    │ • last_enabled  │    │ • Handles commands  │
-│ • Sets alert flag   │    │ • alert flag    │    │ • Reads state       │
-│                     │    │ • statistics    │    │                     │
-└─────────────────────┘    └─────────────────┘    └─────────────────────┘
-        │                                               │
-        ▼                                               ▼
-┌─────────────────────┐                        ┌─────────────────────┐
-│ parking-service-    │                        │ parking-service-    │
-│ monitor.service     │                        │ bot.service         │
-│ (Systemd Service)   │                        │ (Systemd Service)   │
-└─────────────────────┘                        └─────────────────────┘
-```
+The systemd manager reads root-owned mode `0600` environment files before
+dropping privileges. Units use `ProtectSystem=strict`, `ProtectHome=true`,
+`NoNewPrivileges=true`, `PrivateTmp=true`, `UMask=0007`, and only
+`ReadWritePaths=/var/lib/parking-monitor/data`.
 
-## Services
+## Filesystem map
 
-### 1. Monitor Service (`parking-service-monitor`)
+```text
+/opt/parking_monitor/                     root:root, service read-only
+  venv/                                   root:root, service read-only
+  scripts/                                root:root, service read-only
 
-**Purpose**: Continuously monitors the Moscow parking website for availability
+/var/lib/parking-monitor/                 root:root
+  data/                                   root:parking-monitor, 2770
+    state.json                            shared JSON state, 0660
+    state.json.lock                       cross-process lock, 0660
+    notifications.sqlite3[-wal|-shm]      shared SQLite files
+  ms-playwright/                          root:root, service read-only
+  backups/                                root-only update snapshots
 
-**File**: `monitor.py`
+/var/log/parking-monitor/                 root:parking-monitor, 0750
+  monitor.log
+  notifier.log
+  telegram.log
+  discord.log
 
-**Key Functions**:
-- Launches Playwright browser to scrape parking.mos.ru
-- Checks if target parking spot becomes available
-- Updates `state.json` with current status
-- Sets alert flag when parking becomes available
-- Runs in infinite loop with configurable interval
+/etc/parking-monitor/                     root:root, 0700
+  telegram-bot.env                        root:root, 0600
+  discord-bot.env                         root:root, 0600
+  notifier-telegram.env                   root:root, 0600
+  notifier-discord.env                    root:root, 0600
 
-**Systemd Service**: `/etc/systemd/system/parking-service-monitor.service`
-
-### 2. Bot Service (`parking-service-bot`)
-
-**Purpose**: Manages Telegram bot interface and sends notifications
-
-**File**: `telegram_bot.py`
-
-**Key Functions**:
-- Runs Telegram bot with command handlers
-- Reads `state.json` for parking status
-- Sends alerts when parking becomes available
-- Handles user commands (/status, /stats, /interval)
-- Runs background alert loop
-
-**Systemd Service**: `/etc/systemd/system/parking-service-bot.service`
-
-## Communication Mechanism
-
-### State File (`state.json`)
-
-The two services communicate through a shared JSON file:
-
-```json
-{
-  "last_check": "2024-01-17T10:30:00",
-  "last_enabled": false,
-  "alert": true,
-  "interval": 60,
-  "checks": 1234,
-  "hits": 5
-}
+/usr/local/bin/parking-monitor            root-owned regular-file copy, 0755
 ```
 
-**Key Fields**:
-- `last_check`: Timestamp of last website check
-- `last_enabled`: Last known parking availability status
-- `alert`: Flag to trigger Telegram notification
-- `interval`: Monitoring interval in seconds
-- `checks`: Total number of checks performed
-- `hits`: Number of times parking was available
-
-### Data Flow
-
-1. **Monitor Service**:
-   - Scrapes parking website
-   - Updates `last_check` and `last_enabled` in state file
-   - Sets `alert=true` if parking becomes available
-
-2. **Bot Service**:
-   - Reads state file every 5 seconds
-   - If `alert=true`, sends Telegram notification
-   - Sets `alert=false` after sending notification
-   - Responds to user commands by reading state file
-
-## Service Management
-
-### Starting Services
-
-```bash
-# Start both services
-sudo parking-monitor start
-
-# Services are started in order:
-# 1. Monitor service (needs to start first)
-# 2. Bot service (reads state created by monitor)
-```
-
-### Stopping Services
-
-```bash
-# Stop both services
-sudo parking-monitor stop
-
-# Both services are stopped gracefully
-```
-
-### Checking Status
-
-```bash
-# Check both services status
-sudo parking-monitor status
-
-# Shows individual status for each service:
-# - Monitor Service: RUNNING/STOPPED
-# - Bot Service: RUNNING/STOPPED
-# - Resource usage for each
-# - Uptime for each
-```
-
-### Viewing Logs
-
-```bash
-# View logs from both services
-sudo parking-monitor logs
-
-# View specific service logs
-sudo parking-monitor logs -t monitor    # Monitor service only
-sudo parking-monitor logs -t bot        # Bot service only
-
-# Follow logs in real-time
-sudo parking-monitor logs -f
-
-# View log files directly
-tail -f /opt/parking_monitor/logs/monitor.log
-tail -f /opt/parking_monitor/logs/bot.log
-```
-
-## Log Files
-
-Each service maintains its own log file:
-
-- **Monitor logs**: `/opt/parking_monitor/logs/monitor.log`
-  - Web scraping activity
-  - Parking check results
-  - Errors in browser automation
-
-- **Bot logs**: `/opt/parking_monitor/logs/bot.log`
-  - Telegram bot messages
-  - Command processing
-  - Alert notifications
-  - User interactions
-
-## Service Configuration
-
-### Service Files Location
-
-```
-/etc/systemd/system/parking-service-monitor.service
-/etc/systemd/system/parking-service-bot.service
-```
-
-### Key Service Settings
-
-- **User**: `parking_user` (dedicated system user)
-- **Restart**: Always restart on failure
-- **Logging**: Both systemd journal and log files
-- **Security**: Restricted permissions, sandboxed
-
-## Benefits of This Architecture
-
-### 1. **Separation of Concerns**
-- Web scraping logic is separate from Telegram bot logic
-- Each service can be developed, tested, and debugged independently
-- Failures in one service don't directly crash the other
-
-### 2. **Resilience**
-- If monitor service fails, bot service continues running
-- If bot service fails, monitor service continues checking
-- Services can be restarted independently
-
-### 3. **State Persistence**
-- State file survives service restarts
-- Historical data is preserved
-- Services can be updated without losing state
-
-### 4. **Scalability**
-- Can easily add more services (e.g., web interface, API service)
-- Each service can be scaled independently
-- State file provides simple coordination mechanism
-
-### 5. **Debugging**
-- Clear separation of logs for each component
-- Can monitor each service independently
-- Easy to identify which component has issues
-
-## Deployment Sequence
-
-1. **Setup Phase**:
-   ```bash
-   sudo ./scripts/setup-service.sh
-   ```
-
-2. **Configuration Phase**:
-   ```bash
-   # Edit .env file with Telegram tokens
-   sudo nano /opt/parking_monitor/.env
-   ```
-
-3. **Testing Phase**:
-   ```bash
-   sudo parking-monitor test
-   ```
-
-4. **Start Services**:
-   ```bash
-   sudo parking-monitor start
-   ```
-
-5. **Verify Running**:
-   ```bash
-   sudo parking-monitor status
-   sudo parking-monitor monitor
-   ```
-
-## Common Patterns
-
-### Service Dependencies
-
-Monitor service must start before bot service because:
-- Bot service expects state file to exist
-- Initial state is created by monitor service
-- Bot service reads state created by monitor
-
-### Error Handling
-
-- Monitor service: Scrapping errors are logged, service continues
-- Bot service: Telegram errors are logged, service continues
-- Both services: Automatic restart on crash
-
-### Resource Usage
-
-- Monitor service: Higher CPU during browser operations
-- Bot service: Minimal CPU, mostly idle
-- Both services: Low memory footprint
-
-## Troubleshooting
-
-### Service Won't Start
-
-1. Check if both services exist:
-   ```bash
-   systemctl list-unit-files | grep parking-service
-   ```
-
-2. Check individual service status:
-   ```bash
-   systemctl status parking-service-monitor
-   systemctl status parking-service-bot
-   ```
-
-3. Check logs for errors:
-   ```bash
-   journalctl -u parking-service-monitor -n 50
-   journalctl -u parking-service-bot -n 50
-   ```
-
-### No Alerts Being Sent
-
-1. Check if monitor service is running:
-   ```bash
-   sudo parking-monitor status
-   ```
-
-2. Check state file:
-   ```bash
-   cat /opt/parking_monitor/state.json
-   ```
-
-3. Check if bot service is reading alerts:
-   ```bash
-   sudo parking-monitor logs -t bot
-   ```
-
-### High CPU Usage
-
-1. Check which service is using CPU:
-   ```bash
-   sudo parking-monitor monitor resources
-   ```
-
-2. Monitor service might be stuck in browser operations
-3. Consider increasing monitoring interval in state file
-
-## Migration from Single Service
-
-If you're migrating from a single-service setup:
-
-1. **Backup current state**:
-   ```bash
-   cp /opt/parking_monitor/state.json /tmp/state_backup.json
-   ```
-
-2. **Run updated setup script**:
-   ```bash
-   sudo ./scripts/setup-service.sh
-   ```
-
-3. **Restore state**:
-   ```bash
-   cp /tmp/state_backup.json /opt/parking_monitor/state.json
-   ```
-
-4. **Start new dual services**:
-   ```bash
-   sudo parking-monitor start
-   ```
+Playwright uses the explicit unit environment
+`PLAYWRIGHT_BROWSERS_PATH=/var/lib/parking-monitor/ms-playwright`. Setup installs
+Chromium there as root and removes group/other write permission. No unit may
+write the checkout, venv, browser tree, setup scripts, or installed management
+command.
+
+## State consistency
+
+`state_store.py` uses one stable `state.json.lock` file. On POSIX it uses
+`fcntl.flock`; on Windows it uses `msvcrt.locking`, with an additional in-process
+path mutex. A mutation holds the lock across JSON read, field merge, fsync, and
+atomic replace.
+
+The monitor owns `checks`, `hits`, `last_check`, `last_enabled`, and `error`.
+Command front ends own `interval`. Both mutate the newest on-disk object under
+the same lock, so neither can replace the other's concurrent fields. Legacy
+alert migration uses the same protocol.
+
+## Delivery lifecycle
+
+The monitor writes one idempotent event for each false-to-true transition.
+SQLite contains one delivery row per channel. `BEGIN IMMEDIATE` and a claim
+token make claims exclusive across processes; expired claims can be recovered.
+
+- `delivered` is terminal and never re-sent;
+- transient failures become `retry` with bounded delays;
+- authentication/destination failures become `failed`;
+- notifier startup calls `requeue_failed` only for configured channels;
+- absent channel configuration persists `disabled` health and is never claimed.
+
+Retry delay is measured from network completion, not claim start. Unexpected
+exceptions are sanitized with the in-memory configured token before persistence.
+Health transitions are logged immediately and summaries every five minutes.
+
+## Command views
+
+Telegram and Discord call the same `CommandService`. Status includes current
+availability, polling mode, active/normal interval, next expected check, and
+per-channel state/counts. Statistics include checks, hits, rate, last check,
+and per-channel delivered/pending/retrying/failed counts.
+
+Authorization is checked before any state access. Telegram requires the exact
+authorized user and chat. Discord requires the exact guild, channel, and user.
+
+## Update transaction
+
+`parking-monitor update` fetches and stages the target revision in a detached
+worktree. A fresh venv, Chromium tree, test suite, Python compilation, Bash
+syntax, rendered units, and `systemd-analyze verify` must pass before cutover.
+
+All four database users then stop. The management command takes a SQLite backup
+through the SQLite backup API plus the matching state/unit snapshot. Cutover is
+a `git pull --ff-only` followed by verified venv/browser and unit installation.
+Any failure restores the recorded revision, venv, browser tree, units,
+enablement, state, and SQLite snapshot before restarting the previously active
+services.

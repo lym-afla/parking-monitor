@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import monitor
+import state_store
 from monitor import apply_check_result
 from notification_store import NotificationStore
 
@@ -102,6 +103,19 @@ class MonitorEventTests(unittest.TestCase):
         def save_in_memory(state):
             saved_states.append(state.copy())
 
+        def record_error_in_memory(message):
+            state = load_saved_state()
+            state["error"] = message
+            save_in_memory(state)
+            return state
+
+        def record_check_in_memory(enabled, store):
+            state = load_saved_state()
+            became_available = enabled and not state.get("last_enabled", False)
+            apply_check_result(state, enabled, store)
+            save_in_memory(state)
+            return state, became_available
+
         def initialize_store(_database_path):
             factory_calls.append(True)
             if len(factory_calls) == 1:
@@ -127,7 +141,16 @@ class MonitorEventTests(unittest.TestCase):
 
         with (
             patch.object(monitor, "load_state", side_effect=load_saved_state),
-            patch.object(monitor, "save_state", side_effect=save_in_memory),
+            patch.object(
+                monitor,
+                "record_error",
+                side_effect=record_error_in_memory,
+            ),
+            patch.object(
+                monitor,
+                "record_check_result",
+                side_effect=record_check_in_memory,
+            ),
             patch.object(monitor, "check_site", side_effect=check_once_ready),
             patch.object(
                 monitor,
@@ -170,19 +193,19 @@ class MonitorEventTests(unittest.TestCase):
 
                 if failure_point == "staging":
                     failure = patch.object(
-                        monitor.tempfile,
-                        "NamedTemporaryFile",
+                        state_store.tempfile,
+                        "mkstemp",
                         side_effect=OSError("staging failed"),
                     )
                 elif failure_point == "write":
                     failure = patch.object(
-                        monitor.json,
+                        state_store.json,
                         "dump",
                         side_effect=OSError("write failed"),
                     )
                 else:
                     failure = patch.object(
-                        monitor.os,
+                        state_store.os,
                         "replace",
                         side_effect=OSError("replace failed"),
                     )
@@ -197,7 +220,7 @@ class MonitorEventTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     {path.name for path in case_directory.iterdir()},
-                    {"state.json"},
+                    {"state.json", "state.json.lock"},
                 )
 
     def test_transition_retry_after_state_save_failure_reuses_event(self):
@@ -211,19 +234,15 @@ class MonitorEventTests(unittest.TestCase):
         state_path.write_text(json.dumps(original_state), encoding="utf-8")
 
         with patch.object(monitor, "STATE_FILE", str(state_path)):
-            first_attempt = monitor.load_state()
-            apply_check_result(first_attempt, enabled=True, store=self.store)
             with patch.object(
-                monitor.os,
+                state_store.os,
                 "replace",
                 side_effect=OSError("replace failed"),
             ):
                 with self.assertRaises(OSError):
-                    monitor.save_state(first_attempt)
+                    monitor.record_check_result(True, self.store)
 
-            retry = monitor.load_state()
-            apply_check_result(retry, enabled=True, store=self.store)
-            monitor.save_state(retry)
+            monitor.record_check_result(True, self.store)
 
         persisted = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(self.store.event_count(), 1)

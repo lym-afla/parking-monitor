@@ -54,9 +54,13 @@ def status_snapshot():
         normal_interval_seconds=1800,
         effective_interval_seconds=300,
         polling_mode="month-end",
+        next_expected_check="2026-08-27T11:35:00+03:00",
         channel_health={
-            "telegram": ChannelHealth(last_delivered_at="2026-08-27T11:00:00+03:00"),
-            "discord": ChannelHealth(pending_count=1),
+            "telegram": ChannelHealth(
+                last_delivered_at="2026-08-27T11:00:00+03:00",
+                delivered_count=4,
+            ),
+            "discord": ChannelHealth(state="disabled", pending_count=1),
         },
     )
 
@@ -104,6 +108,11 @@ class TelegramAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         self.command_service.status.assert_called_once_with()
         update.message.reply_text.assert_awaited_once()
+        message = update.message.reply_text.await_args.args[0]
+        self.assertIn("Next Expected Check", message)
+        self.assertIn("2026-08-27T11:35:00+03:00", message)
+        self.assertIn("delivered 4", message)
+        self.assertIn("disabled", message.lower())
 
     async def test_unauthorized_callback_is_acknowledged_without_state_or_data(self):
         update = callback_update("stats", user_id=999)
@@ -149,13 +158,16 @@ class TelegramAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 class TelegramStartupTests(unittest.TestCase):
     def _run_main_with(self, application):
         with (
-            patch("telegram_bot.load_config", return_value=runtime_config()),
+            patch(
+                "telegram_bot.load_telegram_command_config",
+                return_value=runtime_config(),
+            ),
             patch("telegram_bot.NotificationStore") as store_type,
             patch("telegram_bot.CommandService"),
             patch("telegram_bot.build_application", return_value=application),
         ):
             store_type.return_value.health_summary = MagicMock()
-            main()
+            return main()
 
     def test_startup_uses_only_polling_bootstrap_to_delete_stale_webhook(self):
         built_application = build_application(runtime_config(), MagicMock())
@@ -192,6 +204,31 @@ class TelegramStartupTests(unittest.TestCase):
         for logger in loggers:
             with self.subTest(logger=logger.name):
                 self.assertFalse(logger.isEnabledFor(logging.INFO))
+
+    def test_startup_exception_logs_only_class_and_generic_message(self):
+        secret = "123456789:startupExceptionMustNeverReachLogsABCDE"
+        application = SimpleNamespace(
+            run_polling=MagicMock(side_effect=RuntimeError(secret))
+        )
+
+        with self.assertLogs("parking_telegram_bot", level="ERROR") as captured:
+            exit_code = self._run_main_with(application)
+
+        output = "\n".join(captured.output)
+        self.assertEqual(exit_code, 1)
+        self.assertIn("RuntimeError", output)
+        self.assertIn("startup failed", output.lower())
+        self.assertNotIn(secret, output)
+
+    def test_missing_telegram_configuration_disables_only_this_service(self):
+        with (
+            patch("telegram_bot.load_telegram_command_config", return_value=None),
+            patch("telegram_bot.NotificationStore") as store_type,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        store_type.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,24 +1,29 @@
 import time
-import json
-import os
 import sys
-import tempfile
 import calendar
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 from config import (
     CHECK_INTERVAL_SECONDS,
+    DATABASE_FILE,
     STATE_FILE,
     TARGET_ADDRESS_TEXT,
     TARGET_REGION_TEXT,
     URL,
 )
+from state_store import mutate_json_state, read_json_state, replace_json_state
 
 MOSCOW_TIMEZONE = timezone(timedelta(hours=3), "MSK")
 MONTH_END_INTERVAL_SECONDS = 300
-DATABASE_PATH = Path(__file__).with_name("notifications.sqlite3")
+DATABASE_PATH = Path(DATABASE_FILE)
 NOTIFICATION_CHANNELS = ("telegram", "discord")
+STATE_DEFAULTS = {
+    "checks": 0,
+    "hits": 0,
+    "last_enabled": False,
+    "interval": CHECK_INTERVAL_SECONDS,
+}
 
 
 def get_polling_schedule(now=None, normal_interval=CHECK_INTERVAL_SECONDS):
@@ -59,53 +64,18 @@ def log(message):
 
 def load_state():
     try:
-        with open(STATE_FILE, "r") as f:
-            state = json.load(f)
-            # Ensure interval has a default value if not present
-            if "interval" not in state:
-                state["interval"] = CHECK_INTERVAL_SECONDS
-            return state
-    except:
-        return {"checks": 0, "hits": 0, "last_enabled": False, "interval": CHECK_INTERVAL_SECONDS}
+        return read_json_state(STATE_FILE, defaults=STATE_DEFAULTS)
+    except (OSError, ValueError):
+        return dict(STATE_DEFAULTS)
 
 def save_state(state):
-    state_path = Path(STATE_FILE)
-    temporary_path = None
-    try:
-        try:
-            existing_mode = state_path.stat().st_mode
-        except FileNotFoundError:
-            existing_mode = None
-
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=state_path.parent,
-            prefix=f".{state_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-            json.dump(state, temporary_file)
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
-
-        if existing_mode is not None:
-            os.chmod(temporary_path, existing_mode)
-        os.replace(temporary_path, state_path)
-        temporary_path = None
-    finally:
-        if temporary_path is not None:
-            try:
-                temporary_path.unlink()
-            except FileNotFoundError:
-                pass
+    replace_json_state(STATE_FILE, state)
 
 
-def apply_check_result(state, enabled, store):
+def apply_check_result(state, enabled, store, checked_at=None):
     """Apply one completed scrape and durably queue an availability transition."""
     state["checks"] = state.get("checks", 0) + 1
-    state["last_check"] = datetime.now().isoformat()
+    state["last_check"] = (checked_at or datetime.now()).isoformat()
 
     if enabled and not state.get("last_enabled", False):
         source_check = state["checks"]
@@ -120,6 +90,33 @@ def apply_check_result(state, enabled, store):
 
     state["last_enabled"] = enabled
     state["error"] = None
+    return state
+
+
+def record_check_result(enabled, store, checked_at=None):
+    """Merge one monitor result without overwriting concurrent command fields."""
+    def update(state):
+        became_available = enabled and not state.get("last_enabled", False)
+        apply_check_result(state, enabled, store, checked_at=checked_at)
+        return became_available
+
+    return mutate_json_state(
+        STATE_FILE,
+        update,
+        defaults=STATE_DEFAULTS,
+    )
+
+
+def record_error(error_message):
+    """Merge a monitor error while retaining interval and previous counters."""
+    def update(state):
+        state["error"] = error_message
+
+    state, _ = mutate_json_state(
+        STATE_FILE,
+        update,
+        defaults=STATE_DEFAULTS,
+    )
     return state
 
 def check_site():
@@ -181,11 +178,9 @@ def run_monitor(store_factory):
                     ) from None
 
             enabled = check_site()
-            was_enabled = state.get("last_enabled", False)
-            apply_check_result(state, enabled, store)
-            if enabled and not was_enabled:
+            state, became_available = record_check_result(enabled, store)
+            if became_available:
                 log("🚨 PARKING BECAME AVAILABLE! Notification event queued.")
-            save_state(state)
 
 
             interval, polling_mode = get_polling_schedule(
@@ -200,16 +195,14 @@ def run_monitor(store_factory):
             log(f"ERROR: {str(e)}")
             import traceback
             traceback.print_exc()
-            # Reload state to ensure we don't overwrite interval changes
-            state = load_state()
-            state["error"] = str(e)
             try:
-                save_state(state)
+                state = record_error(str(e))
             except Exception as state_error:
                 log(
                     "ERROR: State persistence failed "
                     f"({type(state_error).__name__})"
                 )
+                state = load_state()
             interval, polling_mode = get_polling_schedule(
                 normal_interval=state.get("interval", CHECK_INTERVAL_SECONDS)
             )

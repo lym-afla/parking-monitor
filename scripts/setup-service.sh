@@ -1,6 +1,6 @@
 #!/bin/bash
 # Service Setup Script for Parking Monitor
-# Creates user, sets permissions, creates symlink, and configures systemd services
+# Creates isolated users, sets trust boundaries, and configures systemd services
 
 set -euo pipefail
 
@@ -8,10 +8,17 @@ set -euo pipefail
 SERVICE_NAME="parking-service"
 APP_DIR="/opt/parking_monitor"
 VENV_DIR="${APP_DIR}/venv"
-LOG_DIR="/opt/parking_monitor/logs"
-APP_USER="parking_user"
+RUNTIME_ROOT="/var/lib/parking-monitor"
+DATA_DIR="${RUNTIME_ROOT}/data"
+PLAYWRIGHT_BROWSERS_PATH="${RUNTIME_ROOT}/ms-playwright"
+LOG_DIR="/var/log/parking-monitor"
+RUNTIME_GROUP="parking-monitor"
+MONITOR_USER="parking-monitor-monitor"
+NOTIFIER_USER="parking-monitor-notifier"
+TELEGRAM_USER="parking-monitor-telegram"
+DISCORD_USER="parking-monitor-discord"
 SYMLINK_PATH="/usr/local/bin/parking-monitor"
-CONFIG_DIR="/opt/parking_monitor/config"
+CONFIG_DIR="/etc/parking-monitor"
 SYSTEMD_DIR="/etc/systemd/system"
 
 # Colors for output
@@ -45,63 +52,25 @@ check_root() {
     fi
 }
 
-# Detect and configure user
-detect_and_configure_user() {
-    print_header "Configuring application user..."
+# Create four non-login service identities. Their only shared privilege is the
+# runtime group used for state.json and SQLite coordination.
+create_service_identities() {
+    print_header "Configuring isolated service identities..."
 
-    # If APP_USER is set to a specific existing user, use that
-    if [ "$APP_USER" != "parking_user" ] && id "$APP_USER" &>/dev/null; then
-        print_status "Using existing user: $APP_USER"
-        return
+    if ! getent group "$RUNTIME_GROUP" >/dev/null; then
+        groupadd --system "$RUNTIME_GROUP"
     fi
 
-    # If parking_user already exists, use it
-    if id "parking_user" &>/dev/null; then
-        APP_USER="parking_user"
-        print_status "Using existing parking_user"
-        return
-    fi
-
-    # Try to detect the actual user who ran sudo
-    if [ -n "${SUDO_USER:-}" ] && id "$SUDO_USER" &>/dev/null; then
-        print_status "Detected user who ran sudo: $SUDO_USER"
-        echo "Choose user configuration:"
-        echo "1) Create dedicated 'parking_user' (recommended for production)"
-        echo "2) Use existing user '$SUDO_USER'"
-        read -p "Enter choice (1 or 2): " choice
-
-        case $choice in
-            1)
-                create_parking_user
-                ;;
-            2)
-                APP_USER="$SUDO_USER"
-                print_status "Using existing user: $APP_USER"
-                ;;
-            *)
-                print_warning "Invalid choice, creating dedicated user"
-                create_parking_user
-                ;;
-        esac
-    else
-        # Default: create parking_user
-        create_parking_user
-    fi
-}
-
-# Create dedicated parking_user
-create_parking_user() {
-    print_status "Creating dedicated 'parking_user'..."
-
-    # Create system user with home directory
-    useradd --system --create-home --home-dir "/home/parking_user" --shell /bin/bash "parking_user"
-    APP_USER="parking_user"
-    print_status "User $APP_USER configured"
-
-    # Add user to necessary groups
-    usermod -aG systemd-journal "$APP_USER" 2>/dev/null || \
-        print_warning "Could not add $APP_USER to systemd-journal"
-    print_status "User permissions configured"
+    local service_user
+    for service_user in \
+        "$MONITOR_USER" "$NOTIFIER_USER" "$TELEGRAM_USER" "$DISCORD_USER"
+    do
+        if ! id "$service_user" >/dev/null 2>&1; then
+            useradd --system --no-create-home --home-dir /nonexistent \
+                --shell /usr/sbin/nologin --gid "$RUNTIME_GROUP" "$service_user"
+        fi
+    done
+    print_status "Four distinct service identities configured"
 }
 
 # Set up directory permissions
@@ -114,45 +83,77 @@ setup_permissions() {
         exit 1
     fi
 
-    # Create necessary directories
-    mkdir -p "$LOG_DIR"
-    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$DATA_DIR" "$PLAYWRIGHT_BROWSERS_PATH" "$LOG_DIR" "$CONFIG_DIR"
 
-    # Adopt the complete checkout so future Git and pip operations can run as
-    # the service account, including updates below nested scripts/tests/docs
-    # directories. Chown preserves executable modes; never recursively chmod
-    # the checkout or chmod virtual-environment internals.
-    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
-    chmod 0755 "$APP_DIR" "$LOG_DIR"
+    # Trusted code, Git metadata, the virtual environment, and root-invoked
+    # scripts are immutable to every network-facing service identity.
+    chown -R root:root "$APP_DIR"
+    chmod -R go-w "$APP_DIR"
+    chmod 0755 "$APP_DIR"
+
+    chown root:root "$RUNTIME_ROOT" "$PLAYWRIGHT_BROWSERS_PATH"
+    chmod 0755 "$RUNTIME_ROOT" "$PLAYWRIGHT_BROWSERS_PATH"
+    chown root:"$RUNTIME_GROUP" "$DATA_DIR" "$LOG_DIR"
+    chmod 2770 "$DATA_DIR"
+    chmod 0750 "$LOG_DIR"
+    chown root:root "$CONFIG_DIR"
     chmod 0700 "$CONFIG_DIR"
 
-    local runtime_path
-    for runtime_path in \
-        "$APP_DIR/state.json" \
-        "$APP_DIR/notifications.sqlite3" \
-        "$APP_DIR/notifications.sqlite3-wal" \
-        "$APP_DIR/notifications.sqlite3-shm"
+    # Move legacy mutable files out of the checkout only when every possible
+    # database user is stopped. This makes direct setup invocations fail closed
+    # instead of copying a live SQLite database.
+    local runtime_name
+    local legacy_runtime_present=false
+    for runtime_name in \
+        state.json state.json.lock notifications.sqlite3 \
+        notifications.sqlite3-wal notifications.sqlite3-shm
     do
-        if [ -e "$runtime_path" ]; then
-            chown "$APP_USER:$APP_USER" "$runtime_path"
-            chmod 0600 "$runtime_path"
+        if [ -e "$APP_DIR/$runtime_name" ]; then
+            legacy_runtime_present=true
+        fi
+    done
+    if "$legacy_runtime_present"; then
+        local unit
+        for unit in \
+            "${SERVICE_NAME}-monitor" "${SERVICE_NAME}-notifier" \
+            "${SERVICE_NAME}-bot" "${SERVICE_NAME}-discord" "${SERVICE_NAME}"
+        do
+            if systemctl is-active --quiet "$unit"; then
+                print_error "Refusing legacy runtime migration while $unit is active"
+                return 1
+            fi
+        done
+    fi
+    for runtime_name in \
+        state.json state.json.lock notifications.sqlite3 \
+        notifications.sqlite3-wal notifications.sqlite3-shm
+    do
+        if [ -e "$APP_DIR/$runtime_name" ] && [ ! -e "$DATA_DIR/$runtime_name" ]; then
+            mv -- "$APP_DIR/$runtime_name" "$DATA_DIR/$runtime_name"
         fi
     done
 
-    # Runtime secrets live outside the application tree and are never changed here.
-    # Configure git for server deployment
+    local runtime_path
+    for runtime_path in "$DATA_DIR"/*; do
+        if [ -e "$runtime_path" ]; then
+            chown root:"$RUNTIME_GROUP" "$runtime_path"
+            chmod 0660 "$runtime_path"
+        fi
+    done
+
+    local log_name
+    for log_name in monitor.log notifier.log telegram.log discord.log; do
+        touch "$LOG_DIR/$log_name"
+        chown root:"$RUNTIME_GROUP" "$LOG_DIR/$log_name"
+        chmod 0640 "$LOG_DIR/$log_name"
+    done
+
+    # Configure Git only for the root-owned operational checkout.
     if [ -d "$APP_DIR/.git" ]; then
         print_status "Configuring git for server deployment..."
-        sudo -u "$APP_USER" bash -c "
-            cd '$APP_DIR'
-            git config core.filemode false
-            git config core.autocrlf false
-            git config --global --add safe.directory '$APP_DIR'
-        "
-
-        # Also add safe.directory for root user
+        git -C "$APP_DIR" config core.filemode false
+        git -C "$APP_DIR" config core.autocrlf false
         git config --global --add safe.directory "$APP_DIR"
-
         print_status "Git configuration completed"
     fi
 
@@ -169,6 +170,15 @@ render_service_unit() {
     local program="$4"
     local log_name="$5"
     local unit_path="${output_directory}/${SERVICE_NAME}-${component}.service"
+    local service_user
+
+    case "$component" in
+        monitor) service_user="$MONITOR_USER" ;;
+        notifier) service_user="$NOTIFIER_USER" ;;
+        bot) service_user="$TELEGRAM_USER" ;;
+        discord) service_user="$DISCORD_USER" ;;
+        *) print_error "Unsupported service component: $component"; return 1 ;;
+    esac
 
     cat > "$unit_path" << EOF
 [Unit]
@@ -178,18 +188,37 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=${APP_USER}
-Group=${APP_USER}
+User=${service_user}
+Group=${RUNTIME_GROUP}
 WorkingDirectory=${APP_DIR}
 Environment=PATH=${APP_DIR}/venv/bin
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=/etc/parking-monitor.env
+EOF
+
+    case "$component" in
+        monitor)
+            echo "Environment=PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH}" \
+                >> "$unit_path"
+            ;;
+        notifier)
+            echo "EnvironmentFile=-${CONFIG_DIR}/notifier-telegram.env" >> "$unit_path"
+            echo "EnvironmentFile=-${CONFIG_DIR}/notifier-discord.env" >> "$unit_path"
+            ;;
+        bot)
+            echo "EnvironmentFile=-${CONFIG_DIR}/telegram-bot.env" >> "$unit_path"
+            ;;
+        discord)
+            echo "EnvironmentFile=-${CONFIG_DIR}/discord-bot.env" >> "$unit_path"
+            ;;
+    esac
+
+    cat >> "$unit_path" << EOF
 ExecStart=${APP_DIR}/venv/bin/python ${APP_DIR}/${program}
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:${LOG_DIR}/${log_name}
 StandardError=append:${LOG_DIR}/${log_name}
-UMask=0077
+UMask=0007
 
 # Security settings
 NoNewPrivileges=true
@@ -202,7 +231,7 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 LockPersonality=true
 RestrictSUIDSGID=true
-ReadWritePaths=${APP_DIR}
+ReadWritePaths=${DATA_DIR}
 EOF
 
     cat >> "$unit_path" << EOF
@@ -262,9 +291,9 @@ remove_legacy_aggregate_service() {
     print_status "Removed obsolete ${legacy_unit}"
 }
 
-# Create symlink for management script
-create_symlink() {
-    print_header "Creating management script symlink..."
+# Install an immutable root-owned copy of the management script.
+create_management_command() {
+    print_header "Installing management command..."
 
     local script_path="$APP_DIR/scripts/manage-parking-monitor.sh"
 
@@ -272,27 +301,15 @@ create_symlink() {
         print_error "Management script not found: $script_path"
         return 1
     fi
-    if [ ! -x "$script_path" ]; then
-        print_error "Management script is not executable: $script_path"
+    if ! install -o root -g root -m 0755 "$script_path" "$SYMLINK_PATH"; then
+        print_error "Management command installation failed"
         return 1
     fi
-
-    # Remove existing symlink if it exists
-    if [ -L "$SYMLINK_PATH" ]; then
-        rm "$SYMLINK_PATH"
-        print_warning "Removed existing symlink"
-    fi
-
-    # Create new symlink
-    ln -s "$script_path" "$SYMLINK_PATH"
-    print_status "Symlink created: $SYMLINK_PATH -> $script_path"
-
-    # Test symlink
-    if [ -x "$SYMLINK_PATH" ]; then
-        print_status "Symlink is working correctly"
+    if [ -f "$SYMLINK_PATH" ] && [ ! -L "$SYMLINK_PATH" ]; then
+        print_status "Root-owned management command installed: $SYMLINK_PATH"
         print_status "You can now use: sudo parking-monitor <command>"
     else
-        print_error "Symlink test failed"
+        print_error "Management command test failed"
         return 1
     fi
 }
@@ -319,8 +336,10 @@ enable_service() {
 show_summary() {
     print_header "Setup Summary"
     echo
-    print_status "Application user: $APP_USER"
+    print_status "Service users: $MONITOR_USER, $NOTIFIER_USER, $TELEGRAM_USER, $DISCORD_USER"
     print_status "Application directory: $APP_DIR"
+    print_status "Runtime data directory: $DATA_DIR"
+    print_status "Playwright browser directory: $PLAYWRIGHT_BROWSERS_PATH"
     print_status "Log directory: $LOG_DIR"
     print_status "Config directory: $CONFIG_DIR"
     print_status "Service name: $SERVICE_NAME"
@@ -351,7 +370,7 @@ show_summary() {
     echo "  Discord: $(systemctl is-enabled "$SERVICE_NAME-discord" --quiet && echo "Enabled" || echo "Disabled") | $(systemctl is-active "$SERVICE_NAME-discord" --quiet && echo "Running" || echo "Stopped")"
     echo
     print_status "Configuration file:"
-    echo "  /etc/parking-monitor.env (root:root, mode 0600)"
+    echo "  $CONFIG_DIR/*.env (root:root, mode 0600)"
     echo
     print_status "Important environment variables to set:"
     echo "  TELEGRAM_BOT_TOKEN           - Your Telegram bot token"
@@ -399,8 +418,8 @@ validate_environment() {
     fi
 
     # This script deliberately does not create, overwrite, or chmod secrets.
-    if [ ! -f "/etc/parking-monitor.env" ]; then
-        print_warning "Secrets are not installed at /etc/parking-monitor.env"
+    if ! compgen -G "$CONFIG_DIR/*.env" >/dev/null; then
+        print_warning "No scoped secret files are installed in $CONFIG_DIR"
         print_status "Before starting services, run: sudo ./scripts/configure-secrets.sh"
     else
         print_status "Root-managed environment file found"
@@ -415,7 +434,7 @@ install_dependencies() {
 
     if [ ! -d "$VENV_DIR" ]; then
         print_status "Creating virtual environment..."
-        sudo -u "$APP_USER" python3 -m venv "$VENV_DIR"
+        python3 -m venv "$VENV_DIR"
         print_status "Virtual environment created"
     fi
 
@@ -428,8 +447,8 @@ install_dependencies() {
 
     # Install Python dependencies
     if [ -f "$APP_DIR/requirements.txt" ]; then
-        sudo -u "$APP_USER" "$VENV_DIR/bin/python" -m pip install --upgrade pip --quiet
-        sudo -u "$APP_USER" "$VENV_DIR/bin/python" -m pip install -r "$APP_DIR/requirements.txt" --quiet
+        "$VENV_DIR/bin/python" -m pip install --upgrade pip --quiet
+        "$VENV_DIR/bin/python" -m pip install -r "$APP_DIR/requirements.txt" --quiet
         print_status "Python dependencies installed"
     else
         print_error "requirements.txt not found at $APP_DIR/requirements.txt"
@@ -438,8 +457,11 @@ install_dependencies() {
 
     # Install Playwright browsers
     print_status "Installing Playwright browsers..."
-    sudo -u "$APP_USER" "$VENV_DIR/bin/python" -m playwright install chromium
+    PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
+        "$VENV_DIR/bin/python" -m playwright install chromium
     "$VENV_DIR/bin/python" -m playwright install-deps chromium
+    chown -R root:root "$PLAYWRIGHT_BROWSERS_PATH" "$VENV_DIR"
+    chmod -R go-w "$PLAYWRIGHT_BROWSERS_PATH" "$VENV_DIR"
 
     print_status "Dependencies installed successfully"
 }
@@ -451,11 +473,11 @@ main() {
 
     check_root
     validate_environment
-    detect_and_configure_user
+    create_service_identities
     setup_permissions
     install_dependencies
     create_service_file
-    create_symlink
+    create_management_command
     enable_service
     echo
     show_summary
@@ -465,8 +487,10 @@ main() {
 
 install_units_only() {
     check_root
+    create_service_identities
+    setup_permissions
     create_service_file
-    create_symlink
+    create_management_command
     enable_service
     print_header "Systemd units installed successfully"
 }
@@ -476,10 +500,10 @@ show_help() {
     echo "Parking Monitor Service Setup Script"
     echo
     echo "This script sets up the parking monitor as a systemd service with:"
-    echo "  - Dedicated application user (parking_user)"
+    echo "  - Four isolated non-login service users"
     echo "  - Proper file permissions and security"
     echo "  - Four hardened systemd service configurations"
-    echo "  - Management script symlink (parking-monitor command)"
+    echo "  - Root-owned management command copy"
     echo
     echo "Usage: sudo $0"
     echo "       sudo $0 --install-units"

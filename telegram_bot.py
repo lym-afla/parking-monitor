@@ -7,15 +7,23 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from command_service import ChannelHealth, CommandService, StatsSnapshot, StatusSnapshot
-from config import STATE_FILE, RuntimeConfig, load_config
+from config import (
+    STATE_FILE,
+    DATABASE_FILE,
+    RuntimeConfig,
+    TelegramCommandConfig,
+    load_telegram_command_config,
+)
 from notification_store import NotificationStore
 
 
 LOGGER = logging.getLogger("parking_telegram_bot")
-DATABASE_PATH = Path(__file__).with_name("notifications.sqlite3")
+DATABASE_PATH = Path(DATABASE_FILE)
 
 
-def is_authorized(update: Update, config: RuntimeConfig) -> bool:
+def is_authorized(
+    update: Update, config: RuntimeConfig | TelegramCommandConfig
+) -> bool:
     """Return whether an update is from the one allowed user in the allowed chat."""
     user = update.effective_user
     chat = update.effective_chat
@@ -83,7 +91,8 @@ def format_interval(seconds: int) -> str:
 def _health_line(channel: str, health: ChannelHealth) -> str:
     last_delivery = health.last_delivered_at or "Never"
     return (
-        f"*{channel.title()}:* last {last_delivery}; "
+        f"*{channel.title()}:* {health.state}; last {last_delivery}; "
+        f"delivered {health.delivered_count}, "
         f"pending {health.pending_count}, retrying {health.retrying_count}, "
         f"failed {health.failed_count}"
     )
@@ -104,6 +113,7 @@ def format_status_message(status: StatusSnapshot) -> str:
         "🅿️ *Parking Monitor Status*\n\n"
         f"📊 *Current Status:* {availability}\n"
         f"🕐 *Last Check:* {status.last_check or 'Never'}\n"
+        f"⏭️ *Next Expected Check:* {status.next_expected_check or 'Unknown'}\n"
         f"🔄 *Polling Mode:* {status.polling_mode}\n"
         f"⏱️ *Active Interval:* {format_interval(status.effective_interval_seconds)}\n"
         f"⚙️ *Normal Interval:* {format_interval(status.normal_interval_seconds)}\n\n"
@@ -137,7 +147,11 @@ def _welcome_message() -> str:
 class TelegramHandlers:
     """Authorized Telegram handlers backed by the shared command service."""
 
-    def __init__(self, command_service: CommandService, config: RuntimeConfig):
+    def __init__(
+        self,
+        command_service: CommandService,
+        config: RuntimeConfig | TelegramCommandConfig,
+    ):
         self._command_service = command_service
         self._config = config
 
@@ -281,7 +295,10 @@ class TelegramHandlers:
                 raise
 
 
-def build_application(config: RuntimeConfig, command_service: CommandService) -> Application:
+def build_application(
+    config: RuntimeConfig | TelegramCommandConfig,
+    command_service: CommandService,
+) -> Application:
     handlers = TelegramHandlers(command_service, config)
     application = Application.builder().token(config.telegram_bot_token).build()
     application.add_handler(CommandHandler("start", handlers.start))
@@ -292,21 +309,35 @@ def build_application(config: RuntimeConfig, command_service: CommandService) ->
     return application
 
 
-def main() -> None:
+def main() -> int:
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("telegram.request").setLevel(logging.WARNING)
-    config = load_config()
-    store = NotificationStore(
-        DATABASE_PATH,
-        secrets=(config.telegram_bot_token, config.discord_bot_token),
-    )
-    command_service = CommandService(STATE_FILE, health_provider=store.health_summary)
-    application = build_application(config, command_service)
-    LOGGER.info("Telegram polling starting")
-    application.run_polling(drop_pending_updates=True)
+    logging.getLogger("telegram.request.HTTPXRequest").setLevel(logging.WARNING)
+    try:
+        config = load_telegram_command_config()
+        if config is None:
+            LOGGER.warning("Telegram command service disabled: configuration absent")
+            return 0
+        store = NotificationStore(
+            DATABASE_PATH,
+            secrets=(config.telegram_bot_token,),
+        )
+        command_service = CommandService(
+            STATE_FILE, health_provider=store.health_summary
+        )
+        application = build_application(config, command_service)
+        LOGGER.info("Telegram polling starting")
+        application.run_polling(drop_pending_updates=True)
+        return 0
+    except Exception as exc:
+        LOGGER.error(
+            "Telegram startup failed error_class=%s",
+            type(exc).__name__,
+        )
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

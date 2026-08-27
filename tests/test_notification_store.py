@@ -2,7 +2,9 @@ import json
 import secrets
 import sqlite3
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -87,6 +89,22 @@ class NotificationStoreTests(unittest.TestCase):
         self.assertIsNotNone(first)
         self.assertIsNone(second)
 
+    def test_synchronized_claim_contention_has_exactly_one_winner(self):
+        event_id = self.create_dual_channel_event()
+        barrier = threading.Barrier(8)
+
+        def contend():
+            store = NotificationStore(self.db_path)
+            barrier.wait(timeout=5)
+            return store.claim_due("telegram", NOW)
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            claims = list(executor.map(lambda _: contend(), range(8)))
+
+        winners = [claim for claim in claims if claim is not None]
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(winners[0].event_id, event_id)
+
     def test_successful_channel_is_not_claimed_again_when_other_channel_retries(self):
         self.create_dual_channel_event()
         telegram = self.store.claim_due("telegram", NOW)
@@ -167,6 +185,55 @@ class NotificationStoreTests(unittest.TestCase):
         self.assertIsNone(
             self.store.claim_due("discord", NOW + timedelta(days=30))
         )
+
+    def test_requeue_failed_recovers_only_selected_channel_immediately(self):
+        event_id = self.create_dual_channel_event()
+        self.store.mark_failed(
+            self.store.claim_due("telegram", NOW), "unauthorized", NOW
+        )
+        self.store.mark_failed(
+            self.store.claim_due("discord", NOW), "forbidden", NOW
+        )
+
+        requeued = self.store.requeue_failed(
+            "telegram", NOW + timedelta(days=1)
+        )
+
+        self.assertEqual(requeued, 1)
+        self.assertIsNotNone(
+            self.store.claim_due("telegram", NOW + timedelta(days=1))
+        )
+        self.assertIsNone(
+            self.store.claim_due("discord", NOW + timedelta(days=1))
+        )
+        self.assertEqual(self.store.delivery(event_id, "discord").status, "failed")
+
+    def test_disabled_channel_health_is_persisted_across_store_reopen(self):
+        self.store.set_channel_enabled("telegram", False, NOW)
+
+        reopened = NotificationStore(self.db_path)
+        health = reopened.health_summary()
+
+        self.assertEqual(health["telegram"].state, "disabled")
+        self.assertEqual(health["discord"].state, "healthy")
+
+    def test_disabled_channel_cannot_be_claimed_until_reenabled(self):
+        event_id = self.store.create_event(
+            "parking_available",
+            {"available": True},
+            1,
+            ("telegram",),
+        )
+        due_at = NOW + timedelta(days=1)
+
+        self.store.set_channel_enabled("telegram", False, NOW)
+        self.assertIsNone(self.store.claim_due("telegram", due_at))
+        self.assertEqual(self.store.delivery(event_id, "telegram").status, "pending")
+
+        self.store.set_channel_enabled("telegram", True, due_at)
+        claim = self.store.claim_due("telegram", due_at)
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.event_id, event_id)
 
     def test_store_sanitizes_and_bounds_errors(self):
         self.create_dual_channel_event()
@@ -259,12 +326,16 @@ class NotificationStoreTests(unittest.TestCase):
         self.assertEqual(
             asdict(health["telegram"]),
             {
+                "state": "failed",
                 "last_delivered_at": NOW.isoformat(),
+                "delivered_count": 1,
                 "pending_count": 0,
                 "retrying_count": 0,
                 "failed_count": 1,
             },
         )
+        self.assertEqual(health["discord"].state, "retrying")
+        self.assertEqual(health["discord"].delivered_count, 0)
         self.assertEqual(health["discord"].pending_count, 1)
         self.assertEqual(health["discord"].retrying_count, 1)
         self.assertEqual(health["discord"].failed_count, 0)

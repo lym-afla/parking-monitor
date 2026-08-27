@@ -2,9 +2,9 @@ import json
 import logging
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -13,10 +13,13 @@ from notification_store import NotificationStore, sanitize_error
 from notifier import (
     DeliveryResult,
     DiscordAdapter,
+    HealthReporter,
     Notifier,
     TelegramAdapter,
     classify_http_failure,
     configure_logging,
+    initialize_channels,
+    run_cycle,
 )
 
 
@@ -124,6 +127,110 @@ class NotifierWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.last_error, "connection reset")
         self.assertEqual(self.store.delivery(event_id, "discord").status, "delivered")
 
+    async def test_unexpected_token_bearing_adapter_error_is_sanitized(self):
+        secret = "123456789:unexpectedAdapterExceptionSecretABCDE"
+        store = NotificationStore(
+            Path(self.temporary_directory.name) / "secret-aware.sqlite3",
+            secrets=(secret,),
+        )
+
+        class RaisingAdapter:
+            async def send(self, claim):
+                raise RuntimeError(f"adapter failed with {secret}")
+
+        event_id = store.create_event("parking_available", {}, 4, ("telegram",))
+        worker = Notifier(store, {"telegram": RaisingAdapter()})
+
+        with self.assertLogs("parking_notifier", level="INFO") as captured:
+            await worker.run_once(NOW)
+
+        record = store.delivery(event_id, "telegram")
+        self.assertEqual(record.status, "retry")
+        self.assertNotIn(secret, record.last_error)
+        self.assertNotIn(secret, "\n".join(captured.output))
+
+    async def test_retry_backoff_starts_after_network_completion(self):
+        completed_at = NOW + timedelta(seconds=45)
+        event_id = self.store.create_event(
+            "parking_available", {}, 5, ("telegram",)
+        )
+        worker = Notifier(
+            self.store,
+            {"telegram": FailingAdapter("timeout")},
+            now_provider=lambda: completed_at,
+        )
+
+        await worker.run_once(NOW)
+
+        record = self.store.delivery(event_id, "telegram")
+        self.assertEqual(
+            datetime.fromisoformat(record.next_attempt_at),
+            completed_at + timedelta(seconds=30),
+        )
+
+    async def test_idle_cycle_sleeps_five_seconds_and_emits_initial_health(self):
+        worker = Notifier(self.store, {})
+        reporter = HealthReporter()
+        sleep = AsyncMock()
+
+        with self.assertLogs("parking_notifier", level="INFO") as captured:
+            attempted = await run_cycle(
+                worker,
+                self.store,
+                reporter,
+                now=NOW,
+                sleep=sleep,
+            )
+
+        self.assertEqual(attempted, 0)
+        sleep.assert_awaited_once_with(5)
+        output = "\n".join(captured.output)
+        self.assertIn("health summary", output)
+        self.assertIn("channel=telegram", output)
+
+    def test_health_summary_is_repeated_after_five_minutes_only(self):
+        reporter = HealthReporter()
+
+        with self.assertLogs("parking_notifier", level="INFO") as first:
+            reporter.report_if_due(self.store, NOW)
+        with self.assertNoLogs("parking_notifier", level="INFO"):
+            reporter.report_if_due(self.store, NOW + timedelta(seconds=299))
+        with self.assertLogs("parking_notifier", level="INFO") as second:
+            reporter.report_if_due(self.store, NOW + timedelta(seconds=300))
+
+        self.assertIn("health summary", "\n".join(first.output))
+        self.assertIn("health summary", "\n".join(second.output))
+
+
+class NotifierStartupTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.store = NotificationStore(
+            Path(self.temporary_directory.name) / "notifications.sqlite3"
+        )
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def test_configured_channel_requeues_failed_while_missing_sibling_is_disabled(self):
+        event_id = self.store.create_event(
+            "parking_available", {}, 6, ("telegram", "discord")
+        )
+        self.store.mark_failed(
+            self.store.claim_due("telegram", NOW), "unauthorized", NOW
+        )
+        self.store.mark_failed(
+            self.store.claim_due("discord", NOW), "forbidden", NOW
+        )
+
+        initialize_channels(self.store, {"telegram"}, NOW + timedelta(days=1))
+
+        health = self.store.health_summary()
+        self.assertEqual(health["telegram"].state, "retrying")
+        self.assertEqual(health["discord"].state, "disabled")
+        self.assertEqual(self.store.delivery(event_id, "telegram").status, "retry")
+        self.assertEqual(self.store.delivery(event_id, "discord").status, "failed")
+
 
 class HttpBoundaryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -196,6 +303,17 @@ class HttpBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "retry")
         self.assertNotIn(TOKEN, result.error)
         self.assertNotIn("https://", result.error)
+
+    async def test_read_timeout_is_retryable(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("read timed out", request=request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            self.store.create_event("parking_available", {}, 10, ("telegram",))
+            claim = self.store.claim_due("telegram", NOW)
+            result = await TelegramAdapter(runtime_config(), client).send(claim)
+
+        self.assertEqual(result.status, "retry")
 
 
 class FailurePolicyTests(unittest.TestCase):

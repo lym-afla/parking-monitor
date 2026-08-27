@@ -41,6 +41,10 @@ class CommandServiceTests(unittest.TestCase):
         self.assertEqual(status.polling_mode, "month-end")
         self.assertEqual(status.effective_interval_seconds, 300)
         self.assertEqual(status.normal_interval_seconds, 1800)
+        self.assertEqual(
+            status.next_expected_check,
+            "2026-08-27T11:35:00+03:00",
+        )
 
     def test_set_interval_atomically_updates_normal_interval(self):
         status = self.service.set_normal_interval(900)
@@ -81,6 +85,8 @@ class CommandServiceTests(unittest.TestCase):
         health = {
             "telegram": {
                 "last_delivered_at": "2026-08-27T11:00:00+03:00",
+                "state": "retrying",
+                "delivered_count": 7,
                 "pending_count": 1,
                 "retrying_count": 2,
                 "failed_count": 3,
@@ -93,6 +99,8 @@ class CommandServiceTests(unittest.TestCase):
         self.assertEqual((stats.checks, stats.hits), (12, 3))
         self.assertEqual(stats.channel_health["telegram"].pending_count, 1)
         self.assertEqual(stats.channel_health["telegram"].failed_count, 3)
+        self.assertEqual(stats.channel_health["telegram"].delivered_count, 7)
+        self.assertEqual(stats.channel_health["telegram"].state, "retrying")
 
 
 if __name__ == "__main__":

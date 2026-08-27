@@ -1,16 +1,23 @@
-#!/bin/bash
-# monitor.sh - Monitoring script for parking monitor
+#!/usr/bin/env bash
+# Operator health helper for the four parking-monitor services.
 
-set -e
+set -euo pipefail
 
-# Configuration
 SERVICE_NAME="parking-service"
+UNITS=(
+    "$SERVICE_NAME-monitor"
+    "$SERVICE_NAME-notifier"
+    "$SERVICE_NAME-bot"
+    "$SERVICE_NAME-discord"
+)
 VENV_PATH="/opt/parking_monitor/venv"
-APP_PATH="/opt/parking_monitor"
-LOG_PATH="/opt/parking_monitor/logs"
-STATE_PATH="/opt/parking_monitor/state.json"
+LOG_PATH="/var/log/parking-monitor"
+STATE_PATH="/var/lib/parking-monitor/data/state.json"
+DATABASE_PATH="/var/lib/parking-monitor/data/notifications.sqlite3"
+PLAYWRIGHT_BROWSERS_PATH="/var/lib/parking-monitor/ms-playwright"
+CONFIG_PATH="/etc/parking-monitor"
+LOG_FILES=(monitor.log notifier.log telegram.log discord.log)
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -18,494 +25,201 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# Health check function
-health_check() {
-    echo -e "${BLUE}🏥 Parking Monitor Health Check${NC}"
-    echo "=================================================="
+component_is_intentionally_disabled() {
+    case "$1" in
+        bot) [ ! -f "$CONFIG_PATH/telegram-bot.env" ] ;;
+        discord) [ ! -f "$CONFIG_PATH/discord-bot.env" ] ;;
+        *) return 1 ;;
+    esac
+}
 
-    local issues=0
+service_health() {
+    local component="$1"
+    local unit="$SERVICE_NAME-$component"
 
-    # Check systemd services
-    echo -e "${CYAN}📋 Service Status:${NC}"
-
-    # Monitor service
-    if systemctl is-active --quiet "$SERVICE_NAME-monitor"; then
-        echo "✅ Monitor service is running"
+    if systemctl is-active --quiet "$unit"; then
+        echo "✅ $component service is running"
+    elif component_is_intentionally_disabled "$component"; then
+        echo "⚪ $component service is intentionally disabled (configuration absent)"
     else
-        echo "❌ Monitor service is not running"
-        issues=$((issues + 1))
-    fi
-
-    if systemctl is-enabled --quiet "$SERVICE_NAME-monitor"; then
-        echo "✅ Monitor service is enabled"
-    else
-        echo "⚠️  Monitor service is not enabled (won't start on boot)"
-    fi
-
-    # Bot service
-    if systemctl is-active --quiet "$SERVICE_NAME-bot"; then
-        echo "✅ Bot service is running"
-    else
-        echo "❌ Bot service is not running"
-        issues=$((issues + 1))
-    fi
-
-    if systemctl is-enabled --quiet "$SERVICE_NAME-bot"; then
-        echo "✅ Bot service is enabled"
-    else
-        echo "⚠️  Bot service is not enabled (won't start on boot)"
-    fi
-
-    # Check virtual environment
-    echo -e "${CYAN}🐍 Virtual Environment:${NC}"
-    if [ -d "$VENV_PATH" ]; then
-        echo "✅ Virtual environment exists"
-        echo "Python: $($VENV_PATH/bin/python --version)"
-    else
-        echo "❌ Virtual environment missing"
-        issues=$((issues + 1))
-    fi
-
-    # Check Playwright installation
-    echo -e "${CYAN}🎭 Playwright:${NC}"
-    if [ -d "$VENV_PATH" ]; then
-        if $VENV_PATH/bin/python -c "from playwright.sync_api import sync_playwright" 2>/dev/null; then
-            echo "✅ Playwright is installed"
-        else
-            echo "❌ Playwright not properly installed"
-            issues=$((issues + 1))
-        fi
-    fi
-
-    # Check log files
-    echo -e "${CYAN}📄 Log Files:${NC}"
-
-    # Monitor log file
-    if [ -f "$LOG_PATH/monitor.log" ]; then
-        local monitor_log_size=$(du -h "$LOG_PATH/monitor.log" | cut -f1)
-        echo "✅ Monitor log file exists ($monitor_log_size)"
-
-        # Check for recent activity (last 10 minutes)
-        if find "$LOG_PATH/monitor.log" -newermt "-10 minutes" | grep -q .; then
-            echo "✅ Recent monitor log activity detected"
-        else
-            echo "⚠️  No recent monitor log activity (last 10 minutes)"
-        fi
-
-        # Check for recent errors
-        local monitor_error_count=$(tail -n 100 "$LOG_PATH/monitor.log" | grep -i error | wc -l)
-        if [ "$monitor_error_count" -eq 0 ]; then
-            echo "✅ No recent errors in monitor logs"
-        else
-            echo "⚠️  Found $monitor_error_count recent errors in monitor logs"
-        fi
-    else
-        echo "⚠️  Monitor log file not yet created (normal if service hasn't started)"
-    fi
-
-    # Bot log file
-    if [ -f "$LOG_PATH/bot.log" ]; then
-        local bot_log_size=$(du -h "$LOG_PATH/bot.log" | cut -f1)
-        echo "✅ Bot log file exists ($bot_log_size)"
-
-        # Check for recent activity (last 10 minutes)
-        if find "$LOG_PATH/bot.log" -newermt "-10 minutes" | grep -q .; then
-            echo "✅ Recent bot log activity detected"
-        else
-            echo "⚠️  No recent bot log activity (last 10 minutes)"
-        fi
-
-        # Check for recent errors
-        local bot_error_count=$(tail -n 100 "$LOG_PATH/bot.log" | grep -i error | wc -l)
-        if [ "$bot_error_count" -eq 0 ]; then
-            echo "✅ No recent errors in bot logs"
-        else
-            echo "⚠️  Found $bot_error_count recent errors in bot logs"
-        fi
-    else
-        echo "⚠️  Bot log file not yet created (normal if service hasn't started)"
-    fi
-
-    # Check state file
-    echo -e "${CYAN}💾 State Management:${NC}"
-    if [ -f "$STATE_PATH" ]; then
-        echo "✅ State file exists"
-
-        # Check state file modification time
-        if find "$STATE_PATH" -newermt "-1 hour" | grep -q .; then
-            echo "✅ State file recently updated"
-        else
-            echo "⚠️  State file not updated in the last hour"
-        fi
-
-        # Check if state file is valid JSON
-        if $VENV_PATH/bin/python -m json.tool "$STATE_PATH" >/dev/null 2>&1; then
-            echo "✅ State file is valid JSON"
-        else
-            echo "❌ State file is corrupted"
-            issues=$((issues + 1))
-        fi
-    else
-        echo "⚠️  State file not found (will be created on first run)"
-    fi
-
-    # Check configuration
-    echo -e "${CYAN}⚙️  Configuration:${NC}"
-    if [ -f "$APP_PATH/config.py" ]; then
-        echo "✅ Configuration file exists (config.py)"
-
-        # Check for required configuration using Python
-        if [ -d "$VENV_PATH" ]; then
-            if $VENV_PATH/bin/python -c "
-import sys
-sys.path.append('$APP_PATH')
-try:
-    import config
-    required_vars = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
-    missing_vars = []
-    for var in required_vars:
-        if not hasattr(config, var) or getattr(config, var) == '' or getattr(config, var).startswith('YOUR_'):
-            missing_vars.append(var)
-
-    if missing_vars:
-        print(f'⚠️  Missing or unconfigured variables: {\", \".join(missing_vars)}')
-        exit(1)
-    else:
-        print('✅ All required configuration variables present')
-except Exception as e:
-    print(f'❌ Configuration error: {e}')
-    exit(1)
-" 2>/dev/null; then
-                echo "✅ Configuration is valid"
-            else
-                echo "⚠️  Configuration needs attention"
-                issues=$((issues + 1))
-            fi
-        fi
-    else
-        echo "❌ Configuration file missing"
-        issues=$((issues + 1))
-    fi
-
-    # Check disk space
-    echo -e "${CYAN}💾 Disk Space:${NC}"
-    local disk_usage=$(df "$APP_PATH" | awk 'NR==2 {print $5}' | sed 's/%//')
-    if [ "$disk_usage" -lt 80 ]; then
-        echo "✅ Disk usage: ${disk_usage}%"
-    else
-        echo "⚠️  High disk usage: ${disk_usage}%"
-        if [ "$disk_usage" -gt 90 ]; then
-            issues=$((issues + 1))
-        fi
-    fi
-
-    # Check memory usage
-    echo -e "${CYAN}🧠 Memory Usage:${NC}"
-    local mem_usage=$(free | awk 'NR==2{printf "%.0f", $3/$2*100}')
-    if [ "$mem_usage" -lt 80 ]; then
-        echo "✅ Memory usage: ${mem_usage}%"
-    else
-        echo "⚠️  High memory usage: ${mem_usage}%"
-    fi
-
-    # Check network connectivity (if service is running)
-    echo -e "${CYAN}🌐 Network Connectivity:${NC}"
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        # Test connectivity to parking.mos.ru
-        if ping -c 1 parking.mos.ru >/dev/null 2>&1; then
-            echo "✅ Can reach parking.mos.ru"
-        else
-            echo "❌ Cannot reach parking.mos.ru"
-            issues=$((issues + 1))
-        fi
-    else
-        echo "⚠️  Service not running - cannot test connectivity"
-    fi
-
-    # Summary
-    echo ""
-    echo -e "${CYAN}📊 Health Summary:${NC}"
-    if [ $issues -eq 0 ]; then
-        echo -e "${GREEN}✅ All systems operational${NC}"
-        return 0
-    else
-        echo -e "${RED}❌ $issues issue(s) detected${NC}"
+        echo "❌ $component service is not running"
         return 1
     fi
 }
 
-# Resource monitoring
-monitor_resources() {
-    echo -e "${BLUE}📊 Resource Monitoring${NC}"
+health_check() {
+    echo -e "${BLUE}Parking Monitor Health Check${NC}"
     echo "=================================================="
+    local issues=0
+    local component
 
-    # CPU usage
-    echo -e "${CYAN}🖥️  CPU Usage:${NC}"
-    top -bn1 | grep "Cpu(s)" | awk '{print $2}' | sed 's/%us,//'
+    echo -e "${CYAN}Service status:${NC}"
+    for component in monitor notifier bot discord; do
+        service_health "$component" || issues=$((issues + 1))
+        if ! systemctl is-enabled --quiet "$SERVICE_NAME-$component"; then
+            echo "⚠️  $component service is not enabled at boot"
+        fi
+    done
 
-    # Memory usage
-    echo -e "${CYAN}🧠 Memory Usage:${NC}"
-    free -h
-
-    # Process information
-    echo -e "${CYAN}🔍 Parking Monitor Processes:${NC}"
-    ps aux | grep -E "(parking|playwright)" | grep -v grep || echo "No parking monitor processes found"
-
-    # Service status
-    echo -e "${CYAN}📋 Service Status:${NC}"
-    echo "--- Monitor Service ---"
-    systemctl status "$SERVICE_NAME-monitor" --no-pager
-    echo
-    echo "--- Bot Service ---"
-    systemctl status "$SERVICE_NAME-bot" --no-pager
-
-    # Recent logs
-    echo -e "${CYAN}📄 Recent Logs (last 10 lines):${NC}"
-    if [ -f "$LOG_PATH/monitor.log" ]; then
-        echo "--- Monitor Logs ---"
-        tail -n 5 "$LOG_PATH/monitor.log"
-        echo
-    fi
-    if [ -f "$LOG_PATH/bot.log" ]; then
-        echo "--- Bot Logs ---"
-        tail -n 5 "$LOG_PATH/bot.log"
-    fi
-    if [ ! -f "$LOG_PATH/monitor.log" ] && [ ! -f "$LOG_PATH/bot.log" ]; then
-        echo "No log files found"
-    fi
-
-    # State file info
-    echo -e "${CYAN}💾 State File Info:${NC}"
-    if [ -f "$STATE_PATH" ]; then
-        echo "Size: $(du -h "$STATE_PATH" | cut -f1)"
-        echo "Last modified: $(stat -c %y "$STATE_PATH")"
-        echo "Content preview:"
-        head -n 5 "$STATE_PATH" | sed 's/^/  /'
+    echo -e "${CYAN}Trusted runtime:${NC}"
+    if [ -x "$VENV_PATH/bin/python" ]; then
+        echo "✅ Virtual environment: $($VENV_PATH/bin/python --version)"
     else
-        echo "State file not found"
+        echo "❌ Virtual environment is missing"
+        issues=$((issues + 1))
     fi
+    if [ -d "$PLAYWRIGHT_BROWSERS_PATH" ] \
+        && PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
+            "$VENV_PATH/bin/python" \
+            -c "from playwright.sync_api import sync_playwright" \
+            >/dev/null 2>&1; then
+        echo "✅ Playwright and the explicit browser path are available"
+    else
+        echo "❌ Playwright browser installation is unavailable"
+        issues=$((issues + 1))
+    fi
+
+    echo -e "${CYAN}Runtime data:${NC}"
+    if [ -f "$STATE_PATH" ]; then
+        if "$VENV_PATH/bin/python" -m json.tool "$STATE_PATH" >/dev/null 2>&1; then
+            echo "✅ State file is valid JSON"
+        else
+            echo "❌ State file is invalid JSON"
+            issues=$((issues + 1))
+        fi
+    else
+        echo "⚪ State file has not been created yet"
+    fi
+    if [ -f "$DATABASE_PATH" ]; then
+        if "$VENV_PATH/bin/python" - "$DATABASE_PATH" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+try:
+    result = connection.execute("PRAGMA quick_check").fetchone()[0]
+finally:
+    connection.close()
+raise SystemExit(0 if result == "ok" else 1)
+PY
+        then
+            echo "✅ SQLite quick check passed"
+        else
+            echo "❌ SQLite quick check failed"
+            issues=$((issues + 1))
+        fi
+    else
+        echo "⚪ Notification database has not been created yet"
+    fi
+
+    echo -e "${CYAN}Application logs:${NC}"
+    local log_name
+    for log_name in "${LOG_FILES[@]}"; do
+        if [ -f "$LOG_PATH/$log_name" ]; then
+            echo "✅ $log_name ($(du -h "$LOG_PATH/$log_name" | cut -f1))"
+        else
+            echo "❌ $log_name is missing"
+            issues=$((issues + 1))
+        fi
+    done
+
+    echo -e "${CYAN}Scoped configuration:${NC}"
+    for component in telegram-bot discord-bot notifier-telegram notifier-discord; do
+        if [ -f "$CONFIG_PATH/$component.env" ]; then
+            echo "✅ $component.env is installed"
+        else
+            echo "⚪ $component.env is absent"
+        fi
+    done
+
+    echo
+    if [ "$issues" -eq 0 ]; then
+        echo -e "${GREEN}All required services and runtime checks passed${NC}"
+        return 0
+    fi
+    echo -e "${RED}$issues required health check(s) failed${NC}"
+    return 1
 }
 
-# Continuous monitoring
-continuous_monitor() {
-    echo -e "${BLUE}🔄 Starting continuous monitoring...${NC}"
-    echo "Press Ctrl+C to stop"
-    echo ""
+monitor_resources() {
+    echo -e "${BLUE}Parking Monitor Resources${NC}"
+    free -h
+    echo
+    local unit
+    for unit in "${UNITS[@]}"; do
+        systemctl show "$unit" \
+            --property=ActiveState,SubState,MainPID,MemoryCurrent,CPUUsageNSec \
+            --no-pager
+    done
+}
 
+continuous_monitor() {
     while true; do
         clear
-        echo -e "${BLUE}$(date): Parking Monitor Monitor${NC}"
-        echo "=================================================="
-
-        # Quick health check
-        local monitor_running=false
-        local bot_running=false
-
-        if systemctl is-active --quiet "$SERVICE_NAME-monitor"; then
-            echo -e "${GREEN}✅ Monitor: RUNNING${NC}"
-            monitor_running=true
-        else
-            echo -e "${RED}❌ Monitor: STOPPED${NC}"
-        fi
-
-        if systemctl is-active --quiet "$SERVICE_NAME-bot"; then
-            echo -e "${GREEN}✅ Bot: RUNNING${NC}"
-            bot_running=true
-        else
-            echo -e "${RED}❌ Bot: STOPPED${NC}"
-        fi
-
-        if $monitor_running && $bot_running; then
-            echo -e "${GREEN}🟢 SYSTEM: OPERATIONAL${NC}"
-        else
-            echo -e "${RED}🔴 SYSTEM: DEGRADED${NC}"
-        fi
-
-        # CPU and memory
-        local cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | sed 's/%us,//')
-        local mem_usage=$(free | awk 'NR==2{printf "%.0f", $3/$2*100}')
-        echo -e "${CYAN}CPU: ${cpu_usage}% | Memory: ${mem_usage}%${NC}"
-
-        # State file status
-        if [ -f "$STATE_PATH" ]; then
-            local state_age=$(find "$STATE_PATH" -mmin +5 | wc -l)
-            if [ "$state_age" -eq 0 ]; then
-                echo -e "${GREEN}✅ State: Recently updated${NC}"
-            else
-                echo -e "${YELLOW}⚠️  State: Not updated in 5+ minutes${NC}"
-            fi
-        fi
-
-        # Log tail
-        echo -e "${CYAN}Recent activity:${NC}"
-        if [ -f "$LOG_PATH/parking.log" ]; then
-            tail -n 5 "$LOG_PATH/parking.log" | while read line; do
-                echo "  $line"
-            done
-        else
-            echo "  No logs available"
-        fi
-
+        date
+        echo
+        local component
+        for component in monitor notifier bot discord; do
+            service_health "$component" || true
+        done
         sleep 10
     done
 }
 
-# Log analysis
 analyze_logs() {
-    local lines=${1:-100}
-    echo -e "${BLUE}📊 Log Analysis (last $lines lines)${NC}"
-    echo "=================================================="
+    local lines="${1:-100}"
+    if ! [[ "$lines" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Log line count must be a positive integer" >&2
+        return 2
+    fi
 
-    if [ ! -f "$LOG_PATH/monitor.log" ] && [ ! -f "$LOG_PATH/bot.log" ]; then
-        echo "❌ No log files found"
+    local log_name
+    local found=false
+    for log_name in "${LOG_FILES[@]}"; do
+        if [ -f "$LOG_PATH/$log_name" ]; then
+            found=true
+            echo "--- $log_name ---"
+            tail -n "$lines" "$LOG_PATH/$log_name" \
+                | grep -i -E 'error|exception|failed|retry|disabled' \
+                | tail -n 10 || true
+        fi
+    done
+    if ! "$found"; then
+        echo "No application logs are available" >&2
         return 1
-    fi
-
-    # Error count from both logs
-    echo -e "${CYAN}🚨 Error Analysis:${NC}"
-    local monitor_error_count=0
-    local bot_error_count=0
-
-    if [ -f "$LOG_PATH/monitor.log" ]; then
-        monitor_error_count=$(tail -n "$lines" "$LOG_PATH/monitor.log" | grep -i error | wc -l)
-    fi
-
-    if [ -f "$LOG_PATH/bot.log" ]; then
-        bot_error_count=$(tail -n "$lines" "$LOG_PATH/bot.log" | grep -i error | wc -l)
-    fi
-
-    local total_error_count=$((monitor_error_count + bot_error_count))
-    echo "Monitor errors: $monitor_error_count"
-    echo "Bot errors: $bot_error_count"
-    echo "Total errors: $total_error_count"
-
-    if [ $total_error_count -gt 0 ]; then
-        echo -e "${CYAN}Recent errors:${NC}"
-        if [ $monitor_error_count -gt 0 ]; then
-            echo "Monitor errors:"
-            tail -n "$lines" "$LOG_PATH/monitor.log" | grep -i error | tail -n 3
-        fi
-        if [ $bot_error_count -gt 0 ]; then
-            echo "Bot errors:"
-            tail -n "$lines" "$LOG_PATH/bot.log" | grep -i error | tail -n 3
-        fi
-    fi
-
-    # Parking monitoring activity (from monitor log)
-    if [ -f "$LOG_PATH/monitor.log" ]; then
-        echo -e "${CYAN}🅿️  Parking Monitoring Activity:${NC}"
-        local check_count=$(tail -n "$lines" "$LOG_PATH/monitor.log" | grep -i "check\|monitor\|scraping" | wc -l)
-        echo "Monitoring checks: $check_count"
-
-        if [ $check_count -gt 0 ]; then
-            echo -e "${CYAN}Recent monitoring activity:${NC}"
-            tail -n "$lines" "$LOG_PATH/monitor.log" | grep -i "check\|monitor\|scraping" | tail -n 3
-        fi
-    fi
-
-    # Telegram activity (from bot log)
-    if [ -f "$LOG_PATH/bot.log" ]; then
-        echo -e "${CYAN}📱 Telegram Activity:${NC}"
-        local telegram_count=$(tail -n "$lines" "$LOG_PATH/bot.log" | grep -i "telegram\|bot\|message\|command" | wc -l)
-        echo "Telegram-related entries: $telegram_count"
-
-        if [ $telegram_count -gt 0 ]; then
-            echo -e "${CYAN}Recent Telegram activity:${NC}"
-            tail -n "$lines" "$LOG_PATH/bot.log" | grep -i "telegram\|bot\|message\|command" | tail -n 3
-        fi
-    fi
-
-    # Web scraping activity (from monitor log)
-    if [ -f "$LOG_PATH/monitor.log" ]; then
-        echo -e "${CYAN}🕸️  Web Scraping Activity:${NC}"
-        local scraping_count=$(tail -n "$lines" "$LOG_PATH/monitor.log" | grep -i "playwright\|scrape\|page\|element\|browser" | wc -l)
-        echo "Web scraping entries: $scraping_count"
-
-        if [ $scraping_count -gt 0 ]; then
-            echo -e "${CYAN}Recent scraping activity:${NC}"
-            tail -n "$lines" "$LOG_PATH/monitor.log" | grep -i "playwright\|scrape\|page\|element\|browser" | tail -n 3
-        fi
     fi
 }
 
-# Check parking spots status
 check_parking_status() {
-    echo -e "${BLUE}🅿️  Parking Spots Status${NC}"
-    echo "=================================================="
-
     if [ ! -f "$STATE_PATH" ]; then
-        echo "❌ State file not found"
+        echo "State file has not been created yet"
         return 1
     fi
-
-    # Extract and display parking status from state file
-    echo -e "${CYAN}Current State:${NC}"
-
-    # Use Python to parse JSON nicely
-    $VENV_PATH/bin/python -c "
+    "$VENV_PATH/bin/python" - "$STATE_PATH" <<'PY'
 import json
 import sys
-from datetime import datetime
 
-try:
-    with open('$STATE_PATH', 'r') as f:
-        state = json.load(f)
-
-    # Display last update time
-    if 'last_update' in state:
-        print(f'Last update: {state[\"last_update\"]}')
-
-    # Display parking spots
-    if 'parking_spots' in state:
-        print(f'\\n🚗 Parking Spots ({len(state[\"parking_spots\"])} monitored):')
-        for spot in state['parking_spots']:
-            status = '✅ Available' if spot.get('available', False) else '❌ Occupied'
-            name = spot.get('name', 'Unknown')
-            print(f'  {name}: {status}')
-
-    # Display recent alerts
-    if 'recent_alerts' in state and state['recent_alerts']:
-        print(f'\\n📢 Recent Alerts ({len(state[\"recent_alerts\"])}):')
-        for alert in state['recent_alerts'][-5:]:  # Show last 5 alerts
-            time = alert.get('time', 'Unknown time')
-            message = alert.get('message', 'No message')
-            print(f'  {time}: {message}')
-
-except Exception as e:
-    print(f'❌ Error reading state file: {e}')
-    sys.exit(1)
-"
+with open(sys.argv[1], encoding="utf-8") as state_file:
+    state = json.load(state_file)
+print(f"available: {bool(state.get('last_enabled', False))}")
+print(f"checks: {int(state.get('checks', 0))}")
+print(f"hits: {int(state.get('hits', 0))}")
+print(f"last check: {state.get('last_check') or 'never'}")
+print(f"normal interval: {int(state.get('interval', 0))} seconds")
+PY
 }
 
-# Main script logic
 case "${1:-monitor}" in
-    "monitor")
-        health_check
-        ;;
-    "continuous")
-        continuous_monitor
-        ;;
-    "resources")
-        monitor_resources
-        ;;
-    "logs")
-        analyze_logs "${2:-100}"
-        ;;
-    "parking")
-        check_parking_status
-        ;;
-    "help")
-        echo -e "${BLUE}📋 Available commands:${NC}"
-        echo "  $0 monitor     - Run health check (default)"
-        echo "  $0 continuous  - Continuous monitoring"
-        echo "  $0 resources   - Show resource usage"
-        echo "  $0 logs [N]    - Analyze logs (last N lines, default 100)"
-        echo "  $0 parking     - Check current parking spots status"
-        echo "  $0 help        - Show this help"
+    monitor) health_check ;;
+    continuous) continuous_monitor ;;
+    resources) monitor_resources ;;
+    logs) analyze_logs "${2:-100}" ;;
+    parking) check_parking_status ;;
+    help|--help|-h)
+        echo "Usage: $0 {monitor|continuous|resources|logs [N]|parking|help}"
         ;;
     *)
-        echo -e "${RED}❌ Unknown command: $1${NC}"
-        echo "Use '$0 help' for available commands"
-        exit 1
+        echo "Unknown command: $1" >&2
+        exit 2
         ;;
 esac

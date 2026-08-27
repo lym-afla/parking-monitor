@@ -8,10 +8,16 @@ SERVICE_COMPONENTS=(monitor notifier bot discord)
 START_ORDER=(notifier bot discord monitor)
 STOP_ORDER=(monitor discord bot notifier)
 APP_DIR="/opt/parking_monitor"
-APP_USER="parking_user"
 VENV_DIR="/opt/parking_monitor/venv"
-LOG_DIR="/opt/parking_monitor/logs"
-ENV_FILE="/etc/parking-monitor.env"
+RUNTIME_ROOT="/var/lib/parking-monitor"
+DATA_DIR="${RUNTIME_ROOT}/data"
+STATE_PATH="${DATA_DIR}/state.json"
+DATABASE_PATH="${DATA_DIR}/notifications.sqlite3"
+PLAYWRIGHT_BROWSERS_PATH="${RUNTIME_ROOT}/ms-playwright"
+LOG_DIR="/var/log/parking-monitor"
+CONFIG_DIR="/etc/parking-monitor"
+BACKUP_ROOT="${RUNTIME_ROOT}/backups"
+SYSTEMD_DIR="/etc/systemd/system"
 LOG_LINES=50
 GITHUB_REPO_URL="https://github.com/yourusername/parking-monitor.git"  # Update with actual repo
 BRANCH_NAME="main"  # Adjust to your branch
@@ -108,6 +114,8 @@ start_service() {
         if systemctl is-active --quiet "${SERVICE_NAME}-${component}"; then
             print_status "✅ ${component} service started successfully"
             started_services=$((started_services + 1))
+        elif component_is_intentionally_disabled "$component"; then
+            print_warning "${component} service is disabled because its scoped configuration is absent"
         else
             print_error "❌ Failed to start ${component} service"
             systemctl status "${SERVICE_NAME}-${component}" --no-pager -l
@@ -121,6 +129,14 @@ start_service() {
         print_status "🎉 All four services are running"
     fi
     status_service
+}
+
+component_is_intentionally_disabled() {
+    case "$1" in
+        bot) [ ! -f "$CONFIG_DIR/telegram-bot.env" ] ;;
+        discord) [ ! -f "$CONFIG_DIR/discord-bot.env" ] ;;
+        *) return 1 ;;
+    esac
 }
 
 # Stop the services
@@ -341,6 +357,12 @@ capture_and_stop_running_services() {
             systemctl stop "${SERVICE_NAME}-${component}"
         fi
     done
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        if systemctl is-active --quiet "${SERVICE_NAME}-${component}"; then
+            print_error "${component} service did not stop"
+            return 1
+        fi
+    done
 }
 
 restore_running_services() {
@@ -358,131 +380,332 @@ restore_running_services() {
     fi
 }
 
-# Update application
-update_app() {
-    print_header "Updating application..."
-    check_root_for_command "update"
+prepare_update_stage() {
+    local current_revision="$1"
+    local target_revision="$2"
+    local stage_root="$3"
+    local source_dir="$stage_root/source"
+    local stage_venv="$stage_root/venv"
+    local stage_browsers="$stage_root/browsers"
+    local rendered_units="$stage_root/units"
 
-    # Check if git repository exists
-    if [ ! -d "${APP_DIR}/.git" ]; then
-        print_error "No git repository found in ${APP_DIR}"
-        print_status "This script requires the application to be installed from git"
-        exit 1
-    fi
-
-    # Store current directory
-    ORIGINAL_DIR=$(pwd)
-
-    # Change to application directory
-    cd "${APP_DIR}" || {
-        print_error "Cannot access application directory: ${APP_DIR}"
-        exit 1
+    git merge-base --is-ancestor "$current_revision" "$target_revision" || {
+        print_error "Update is not a fast-forward from the installed revision"
+        return 1
     }
+    git worktree add --detach "$source_dir" "$target_revision" || return 1
+    python3 -m venv "$stage_venv" || return 1
+    "$stage_venv/bin/python" -m pip install --upgrade pip --quiet || return 1
+    "$stage_venv/bin/python" -m pip install \
+        -r "$source_dir/requirements.txt" --quiet || return 1
+    PLAYWRIGHT_BROWSERS_PATH="$stage_browsers" \
+        "$stage_venv/bin/python" -m playwright install chromium || return 1
+    (
+        cd "$source_dir" \
+            && "$stage_venv/bin/python" -m unittest discover -v
+    ) || return 1
+    "$stage_venv/bin/python" -m py_compile \
+        "$source_dir/config.py" "$source_dir/state_store.py" \
+        "$source_dir/command_service.py" "$source_dir/notification_store.py" \
+        "$source_dir/notifier.py" "$source_dir/telegram_bot.py" \
+        "$source_dir/discord_bot.py" "$source_dir/monitor.py" || return 1
+    bash -n "$source_dir/scripts/configure-secrets.sh" \
+        "$source_dir/scripts/setup-service.sh" \
+        "$source_dir/scripts/manage-parking-monitor.sh" \
+        "$source_dir/scripts/monitor.sh" || return 1
+    "$source_dir/scripts/setup-service.sh" \
+        --render-only "$rendered_units" || return 1
+    systemd-analyze verify "$rendered_units"/*.service || return 1
+    chown -R root:root "$stage_root" || return 1
+}
 
-    # Backup current version info
-    local current_commit=$(sudo -u "$APP_USER" git rev-parse HEAD 2>/dev/null || echo "unknown")
-    print_status "Current version: ${current_commit:0:8}"
-
-    # Fetch latest changes
-    print_status "Fetching latest changes from repository..."
-    if ! sudo -u "$APP_USER" git fetch origin; then
-        print_error "Failed to fetch from repository"
-        cd "${ORIGINAL_DIR}"
-        exit 1
-    fi
-
-    # Check if there are updates
-    local latest_commit
-    if ! latest_commit=$(sudo -u "$APP_USER" git rev-parse "origin/${BRANCH_NAME}"); then
-        print_error "Cannot resolve origin/${BRANCH_NAME}"
-        cd "${ORIGINAL_DIR}"
-        return 1
-    fi
-    if [ "$current_commit" = "$latest_commit" ]; then
-        print_status "Already up to date; reconciling current service units"
-        if ! "$APP_DIR/scripts/setup-service.sh" --install-units; then
-            print_error "Service unit reconciliation failed"
-            cd "${ORIGINAL_DIR}"
+create_runtime_snapshot() {
+    local backup_dir="$1"
+    local component
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        if systemctl is-active --quiet "${SERVICE_NAME}-${component}"; then
+            print_error "Refusing runtime backup while ${component} is active"
             return 1
         fi
-        cd "${ORIGINAL_DIR}"
-        return 0
-    fi
+    done
 
-    print_status "Stopping currently active services for update..."
-    capture_and_stop_running_services
-
-    # Pull latest changes
-    print_status "Pulling latest version..."
-    if ! sudo -u "$APP_USER" git pull origin ${BRANCH_NAME}; then
-        print_error "Failed to pull latest changes"
-        restore_running_services || true
-        cd "${ORIGINAL_DIR}"
+    [ ! -e "$backup_dir" ] || {
+        print_error "Refusing to reuse runtime snapshot directory"
         return 1
-    fi
-
-    # Show what changed
-    local new_commit
-    if ! new_commit=$(sudo -u "$APP_USER" git rev-parse HEAD); then
-        print_error "Cannot resolve updated revision"
-        restore_running_services || true
-        cd "${ORIGINAL_DIR}"
-        return 1
-    fi
-    print_status "Updated to version: ${new_commit:0:8}"
-
-    if [ "$current_commit" != "unknown" ] && [ "$current_commit" != "$new_commit" ]; then
-        echo
-        print_status "Changes in this update:"
-        sudo -u "$APP_USER" git log --oneline "${current_commit}..${new_commit}" | head -10 || true
-        echo
-    fi
-
-    # Preserve the virtual environment and apply executable mode only to
-    # reviewed operator scripts.
-    print_status "Updating script permissions..."
-    if ! chmod 0755 "${APP_DIR}/scripts/"*.sh; then
-        print_error "Could not restore operator script modes"
-        restore_running_services || true
-        cd "${ORIGINAL_DIR}"
-        return 1
-    fi
-
-    # Activate virtual environment and update dependencies
-    print_status "Updating Python dependencies..."
-    if [ -x "${VENV_DIR}/bin/python" ]; then
-        if ! sudo -u "${APP_USER}" "${VENV_DIR}/bin/python" -m pip \
-            install -r "${APP_DIR}/requirements.txt" --quiet --upgrade; then
-            print_error "Dependency update failed"
-            restore_running_services || true
-            cd "${ORIGINAL_DIR}"
-            return 1
-        fi
-        print_status "Dependencies updated successfully"
+    }
+    install -d -o root -g root -m 0700 \
+        "$backup_dir" "$backup_dir/units" || return 1
+    if [ -f "$STATE_PATH" ]; then
+        cp -a -- "$STATE_PATH" "$backup_dir/state.json" || return 1
+        : > "$backup_dir/state.data" || return 1
+    elif [ -f "$APP_DIR/state.json" ]; then
+        cp -a -- "$APP_DIR/state.json" "$backup_dir/state.json" || return 1
+        : > "$backup_dir/state.checkout" || return 1
     else
-        print_error "Virtual environment not found; update aborted"
-        restore_running_services || true
-        cd "${ORIGINAL_DIR}"
+        : > "$backup_dir/state.absent" || return 1
+    fi
+    local database_source
+    if [ -f "$DATABASE_PATH" ]; then
+        database_source="$DATABASE_PATH"
+        : > "$backup_dir/database.data" || return 1
+    elif [ -f "$APP_DIR/notifications.sqlite3" ]; then
+        database_source="$APP_DIR/notifications.sqlite3"
+        : > "$backup_dir/database.checkout" || return 1
+    else
+        database_source=
+        : > "$backup_dir/database.absent" || return 1
+    fi
+    if [ -n "$database_source" ]; then
+        if ! "$VENV_DIR/bin/python" - "$database_source" \
+            "$backup_dir/notifications.sqlite3" <<'PY'
+import sqlite3
+import sys
+
+source = sqlite3.connect(sys.argv[1])
+destination = sqlite3.connect(sys.argv[2])
+try:
+    source.backup(destination)
+finally:
+    destination.close()
+    source.close()
+PY
+        then
+            return 1
+        fi
+    fi
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        cp -a -- "$SYSTEMD_DIR/${SERVICE_NAME}-${component}.service" \
+            "$backup_dir/units/" || return 1
+        [ -s "$backup_dir/units/${SERVICE_NAME}-${component}.service" ] \
+            || return 1
+    done
+    : > "$backup_dir/enablement.txt" || return 1
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        if systemctl is-enabled --quiet "${SERVICE_NAME}-${component}"; then
+            printf '%s enabled\n' "$component" \
+                >> "$backup_dir/enablement.txt" || return 1
+        else
+            printf '%s disabled\n' "$component" \
+                >> "$backup_dir/enablement.txt" || return 1
+        fi
+    done
+}
+
+fast_forward_checkout() {
+    local expected_revision="$1"
+    git pull --ff-only origin "$BRANCH_NAME" || return 1
+    [ "$(git rev-parse HEAD)" = "$expected_revision" ] || {
+        print_error "Pulled revision does not match the verified staged revision"
+        return 1
+    }
+}
+
+cutover_staged_update() {
+    local target_revision="$1"
+    local stage_root="$2"
+    local backup_dir="$3"
+    local old_venv="${APP_DIR}/.venv-before-update"
+    local old_browsers="${RUNTIME_ROOT}/.browsers-before-update"
+
+    [ ! -e "$old_venv" ] && [ ! -e "$old_browsers" ] || {
+        print_error "A previous update rollback environment still exists"
+        return 1
+    }
+    fast_forward_checkout "$target_revision" || return 1
+    mv -- "$VENV_DIR" "$old_venv" || return 1
+    mv -- "$stage_root/venv" "$VENV_DIR" || return 1
+    if [ -d "$PLAYWRIGHT_BROWSERS_PATH" ]; then
+        mv -- "$PLAYWRIGHT_BROWSERS_PATH" "$old_browsers" || return 1
+    fi
+    cp -a -- "$stage_root/browsers" "$PLAYWRIGHT_BROWSERS_PATH" || return 1
+    chown -R root:root "$APP_DIR" "$PLAYWRIGHT_BROWSERS_PATH" || return 1
+    chmod -R go-w "$APP_DIR" "$PLAYWRIGHT_BROWSERS_PATH" || return 1
+    "$APP_DIR/scripts/setup-service.sh" --install-units || return 1
+    printf '%s\n' "$target_revision" \
+        > "$backup_dir/cutover-revision.txt" || return 1
+}
+
+restore_runtime_snapshot() {
+    local backup_dir="$1"
+    if [ -f "$backup_dir/state.json" ]; then
+        local state_target state_other
+        if [ -f "$backup_dir/state.data" ]; then
+            state_target="$STATE_PATH"
+            state_other="$APP_DIR/state.json"
+        elif [ -f "$backup_dir/state.checkout" ]; then
+            state_target="$APP_DIR/state.json"
+            state_other="$STATE_PATH"
+        else
+            print_error "Runtime snapshot has no state location record"
+            return 1
+        fi
+        cp -a -- "$backup_dir/state.json" "$state_target.restore" || return 1
+        mv -f -- "$state_target.restore" "$state_target" || return 1
+        rm -f -- "$state_other" || return 1
+    elif [ -f "$backup_dir/state.absent" ]; then
+        rm -f -- "$STATE_PATH" "$APP_DIR/state.json" || return 1
+    else
+        print_error "Runtime snapshot has no state presence record"
         return 1
     fi
+    if [ -f "$backup_dir/notifications.sqlite3" ]; then
+        local database_target database_other
+        if [ -f "$backup_dir/database.data" ]; then
+            database_target="$DATABASE_PATH"
+            database_other="$APP_DIR/notifications.sqlite3"
+        elif [ -f "$backup_dir/database.checkout" ]; then
+            database_target="$APP_DIR/notifications.sqlite3"
+            database_other="$DATABASE_PATH"
+        else
+            print_error "Runtime snapshot has no database location record"
+            return 1
+        fi
+        cp -a -- "$backup_dir/notifications.sqlite3" \
+            "$database_target.restore" || return 1
+        mv -f -- "$database_target.restore" "$database_target" || return 1
+        rm -f -- \
+            "$database_target-wal" "$database_target-shm" \
+            "$database_other" "$database_other-wal" "$database_other-shm" \
+            || return 1
+    elif [ -f "$backup_dir/database.absent" ]; then
+        rm -f -- "$DATABASE_PATH" "$DATABASE_PATH-wal" \
+            "$DATABASE_PATH-shm" \
+            "$APP_DIR/notifications.sqlite3" \
+            "$APP_DIR/notifications.sqlite3-wal" \
+            "$APP_DIR/notifications.sqlite3-shm" || return 1
+    else
+        print_error "Runtime snapshot has no database presence record"
+        return 1
+    fi
+}
 
-    # Reconcile the four rendered units on every update. This also removes the
-    # obsolete aggregate unit and verifies daemon-reload/enable operations.
-    if ! "$APP_DIR/scripts/setup-service.sh" --install-units; then
-        print_error "Service unit installation failed"
+rollback_update() {
+    local previous_revision="$1"
+    local backup_dir="$2"
+    local old_venv="${APP_DIR}/.venv-before-update"
+    local old_browsers="${RUNTIME_ROOT}/.browsers-before-update"
+    local component
+
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        systemctl stop "${SERVICE_NAME}-${component}" || true
+    done
+    git reset --hard "$previous_revision" || return 1
+    if [ -d "$old_venv" ]; then
+        if [ -d "$VENV_DIR" ]; then
+            mv -- "$VENV_DIR" "$backup_dir/failed-venv" || return 1
+        fi
+        mv -- "$old_venv" "$VENV_DIR" || return 1
+    fi
+    if [ -d "$old_browsers" ]; then
+        if [ -d "$PLAYWRIGHT_BROWSERS_PATH" ]; then
+            mv -- "$PLAYWRIGHT_BROWSERS_PATH" \
+                "$backup_dir/failed-browsers" || return 1
+        fi
+        mv -- "$old_browsers" "$PLAYWRIGHT_BROWSERS_PATH" || return 1
+    fi
+    restore_runtime_snapshot "$backup_dir" || return 1
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        cp -a -- "$backup_dir/units/${SERVICE_NAME}-${component}.service" \
+            "$SYSTEMD_DIR/" || return 1
+    done
+    [ -s "$backup_dir/enablement.txt" ] || return 1
+    local recorded_state
+    while read -r component recorded_state; do
+        case "$recorded_state" in
+            enabled) systemctl enable "${SERVICE_NAME}-${component}" || return 1 ;;
+            disabled) systemctl disable "${SERVICE_NAME}-${component}" || return 1 ;;
+            *) print_error "Invalid recorded enablement state"; return 1 ;;
+        esac
+    done < "$backup_dir/enablement.txt"
+    install -o root -g root -m 0755 \
+        "$APP_DIR/scripts/manage-parking-monitor.sh" \
+        /usr/local/bin/parking-monitor || return 1
+    systemctl daemon-reload || return 1
+    restore_running_services || return 1
+}
+
+cleanup_update_stage() {
+    local stage_root="$1"
+    case "$stage_root" in
+        /opt/parking-monitor-update.*) ;;
+        *) print_error "Refusing to remove unexpected stage path"; return 1 ;;
+    esac
+    if [ -d "$stage_root/source" ]; then
+        git worktree remove --force "$stage_root/source" || return 1
+    fi
+    rm -rf -- "$stage_root"
+}
+
+finalize_update() {
+    rm -rf -- "${APP_DIR}/.venv-before-update" \
+        "${RUNTIME_ROOT}/.browsers-before-update"
+}
+
+run_update_transaction() {
+    local previous_revision="$1"
+    local target_revision="$2"
+    local stage_root="$3"
+    local backup_dir="$4"
+
+    prepare_update_stage "$previous_revision" "$target_revision" "$stage_root" || {
+        cleanup_update_stage "$stage_root" || true
+        return 1
+    }
+    capture_and_stop_running_services || {
         restore_running_services || true
-        cd "${ORIGINAL_DIR}"
+        cleanup_update_stage "$stage_root" || true
+        return 1
+    }
+    create_runtime_snapshot "$backup_dir" || {
+        restore_running_services || true
+        cleanup_update_stage "$stage_root" || true
+        return 1
+    }
+    if ! cutover_staged_update "$target_revision" "$stage_root" "$backup_dir"; then
+        rollback_update "$previous_revision" "$backup_dir" || true
+        cleanup_update_stage "$stage_root" || true
         return 1
     fi
     if ! restore_running_services; then
-        print_error "One or more services failed after update"
-        cd "${ORIGINAL_DIR}"
+        rollback_update "$previous_revision" "$backup_dir" || true
+        cleanup_update_stage "$stage_root" || true
+        return 1
+    fi
+    finalize_update
+    cleanup_update_stage "$stage_root"
+}
+
+# Update application through a verified staging environment and rollback gate.
+update_app() {
+    print_header "Updating application..."
+    check_root_for_command "update"
+    [ -d "${APP_DIR}/.git" ] || {
+        print_error "No git repository found in ${APP_DIR}"
+        return 1
+    }
+    cd "$APP_DIR" || return 1
+    if [ -n "$(git status --porcelain)" ]; then
+        print_error "Refusing update with local checkout changes"
         return 1
     fi
 
-    cd "${ORIGINAL_DIR}"
+    local previous_revision target_revision stage_root backup_dir
+    previous_revision=$(git rev-parse HEAD) || return 1
+    git fetch origin || return 1
+    target_revision=$(git rev-parse "origin/${BRANCH_NAME}") || return 1
+    if [ "$previous_revision" = "$target_revision" ]; then
+        "$APP_DIR/scripts/setup-service.sh" --install-units
+        return
+    fi
 
-    print_status "Update completed successfully!"
+    stage_root=$(mktemp -d /opt/parking-monitor-update.XXXXXX) || return 1
+    backup_dir="${BACKUP_ROOT}/update-$(date -u +%Y%m%dT%H%M%SZ)"
+    run_update_transaction \
+        "$previous_revision" "$target_revision" "$stage_root" "$backup_dir" || {
+        print_error "Update failed; rollback was attempted"
+        return 1
+    }
+    print_status "Update completed successfully at ${target_revision:0:8}"
 }
 
 test_service_units() {
@@ -498,6 +721,8 @@ test_service_units() {
         fi
         if systemctl is-active --quiet "$unit"; then
             echo "  ${component}: active"
+        elif component_is_intentionally_disabled "$component"; then
+            echo "  ${component}: intentionally disabled (configuration absent)"
         else
             echo "  ${component}: NOT ACTIVE"
             failed=true
@@ -556,7 +781,9 @@ except Exception as e:
     print_status "Test 3: Playwright Installation"
     if [ -d "$VENV_DIR" ]; then
         source "$VENV_DIR/bin/activate"
-        if $VENV_DIR/bin/python -c "from playwright.sync_api import sync_playwright; print('Playwright available')" 2>/dev/null; then
+        if PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
+            $VENV_DIR/bin/python -c "from playwright.sync_api import sync_playwright; print('Playwright available')" 2>/dev/null \
+            && sudo -u parking-monitor-monitor test -r "$PLAYWRIGHT_BROWSERS_PATH"; then
             echo "  ✅ Playwright is installed"
         else
             echo "  ❌ Playwright not properly installed"
@@ -569,36 +796,53 @@ except Exception as e:
     print_status "Test 4: Service Status"
     test_service_units || all_tests_passed=false
 
-    # Test 5: root-owned environment file metadata and required names. Values
-    # are never printed.
+    # Test 5: independently optional, root-owned scoped environment files.
+    # Values are never printed.
     echo
     print_status "Test 5: Configuration"
-    if [ ! -f "$ENV_FILE" ]; then
-        echo "  ❌ Environment file missing: $ENV_FILE"
-        all_tests_passed=false
-    else
-        local metadata
-        metadata=$(stat -c '%U:%G %a' "$ENV_FILE")
+    local config_name service_user required_names metadata variable_name
+    for config_name in \
+        telegram-bot.env discord-bot.env \
+        notifier-telegram.env notifier-discord.env
+    do
+        case "$config_name" in
+            telegram-bot.env)
+                service_user=parking-monitor-telegram
+                required_names="TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID TELEGRAM_AUTHORIZED_USER_ID"
+                ;;
+            discord-bot.env)
+                service_user=parking-monitor-discord
+                required_names="DISCORD_BOT_TOKEN DISCORD_APPLICATION_ID DISCORD_GUILD_ID DISCORD_CHANNEL_ID DISCORD_AUTHORIZED_USER_ID"
+                ;;
+            notifier-telegram.env)
+                service_user=parking-monitor-notifier
+                required_names="TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID"
+                ;;
+            notifier-discord.env)
+                service_user=parking-monitor-notifier
+                required_names="DISCORD_BOT_TOKEN DISCORD_CHANNEL_ID"
+                ;;
+        esac
+        if [ ! -f "$CONFIG_DIR/$config_name" ]; then
+            echo "  ⚪ Channel service disabled: missing $config_name"
+            continue
+        fi
+        metadata=$(stat -c '%U:%G %a' "$CONFIG_DIR/$config_name")
         if [ "$metadata" != "root:root 600" ]; then
-            echo "  ❌ Environment file metadata is $metadata; expected root:root 600"
+            echo "  ❌ $config_name metadata is $metadata; expected root:root 600"
             all_tests_passed=false
         fi
-        local variable_name
-        for variable_name in \
-            TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID TELEGRAM_AUTHORIZED_USER_ID \
-            DISCORD_BOT_TOKEN DISCORD_APPLICATION_ID DISCORD_GUILD_ID \
-            DISCORD_CHANNEL_ID DISCORD_AUTHORIZED_USER_ID
-        do
-            if ! grep -q "^${variable_name}=." "$ENV_FILE"; then
-                echo "  ❌ Missing required variable name: $variable_name"
+        for variable_name in $required_names; do
+            if ! grep -q "^${variable_name}=." "$CONFIG_DIR/$config_name"; then
+                echo "  ❌ $config_name is missing variable: $variable_name"
                 all_tests_passed=false
             fi
         done
-        if sudo -u "$APP_USER" test -r "$ENV_FILE"; then
-            echo "  ❌ $ENV_FILE is readable by $APP_USER"
+        if sudo -u "$service_user" test -r "$CONFIG_DIR/$config_name"; then
+            echo "  ❌ $config_name is directly readable by $service_user"
             all_tests_passed=false
         fi
-    fi
+    done
 
     # Test 6: Log files
     echo
@@ -619,19 +863,15 @@ except Exception as e:
         all_tests_passed=false
     fi
 
-    # Test 7: Symlink
+    # Test 7: root-owned management command copy
     echo
-    print_status "Test 7: Management Symlink"
-    if [ -L "/usr/local/bin/parking-monitor" ]; then
-        echo "  ✅ Symlink exists"
-        if [ -x "/usr/local/bin/parking-monitor" ]; then
-            echo "  ✅ Symlink is executable"
-        else
-            echo "  ❌ Symlink is not executable"
-            all_tests_passed=false
-        fi
+    print_status "Test 7: Management Command"
+    if [ -f "/usr/local/bin/parking-monitor" ] \
+        && [ ! -L "/usr/local/bin/parking-monitor" ] \
+        && [ "$(stat -c '%U:%G %a' /usr/local/bin/parking-monitor)" = "root:root 755" ]; then
+        echo "  ✅ Root-owned management command copy is installed"
     else
-        echo "  ❌ Symlink not found"
+        echo "  ❌ Root-owned management command copy is invalid"
         echo "     Run: cd $APP_DIR && sudo ./scripts/setup-service.sh"
         all_tests_passed=false
     fi
@@ -639,8 +879,9 @@ except Exception as e:
     # Test 8: Permissions
     echo
     print_status "Test 8: File Permissions"
-    if [ -O "$APP_DIR" ] || [ "$(stat -c '%U' $APP_DIR)" = "$APP_USER" ]; then
-        echo "  ✅ Application directory owned by $APP_USER"
+    if [ "$(stat -c '%U:%G' "$APP_DIR")" = "root:root" ] \
+        && [ "$(stat -c '%G %a' "$DATA_DIR")" = "parking-monitor 2770" ]; then
+        echo "  ✅ Trusted code is root-owned and runtime writes are group-scoped"
     else
         echo "  ⚠️  Application directory ownership may be incorrect"
     fi
@@ -739,7 +980,8 @@ show_help() {
     echo "Configuration:"
     echo "  Service name: $SERVICE_NAME"
     echo "  App directory: $APP_DIR"
-    echo "  App user: $APP_USER"
+    echo "  Service users: parking-monitor-monitor/notifier/telegram/discord"
+    echo "  Runtime data: $DATA_DIR"
     echo "  Venv: $VENV_DIR"
     echo "  Logs: $LOG_DIR"
 }

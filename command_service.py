@@ -1,15 +1,13 @@
 """Platform-neutral read and update operations for parking commands."""
 
-import json
-import os
-import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Mapping
 
 from config import CHECK_INTERVAL_SECONDS
 from monitor import get_polling_schedule
+from state_store import mutate_json_state, read_json_state
 
 
 MINIMUM_INTERVAL_SECONDS = 60
@@ -20,7 +18,9 @@ MAXIMUM_INTERVAL_SECONDS = 86400
 class ChannelHealth:
     """Delivery health for one notification channel."""
 
+    state: str = "healthy"
     last_delivered_at: str | None = None
+    delivered_count: int = 0
     pending_count: int = 0
     retrying_count: int = 0
     failed_count: int = 0
@@ -35,6 +35,7 @@ class StatusSnapshot:
     normal_interval_seconds: int
     effective_interval_seconds: int
     polling_mode: str
+    next_expected_check: str | None
     channel_health: Mapping[str, ChannelHealth]
 
 
@@ -84,9 +85,11 @@ class CommandService:
                 f"{MAXIMUM_INTERVAL_SECONDS} seconds"
             )
 
-        state = self._read_state()
-        state["interval"] = seconds
-        self._atomic_write_state(state)
+        state, _ = mutate_json_state(
+            self._state_path,
+            lambda current: current.__setitem__("interval", seconds),
+            defaults={"interval": CHECK_INTERVAL_SECONDS},
+        )
         return self._status_from_state(state, now=None)
 
     def _status_from_state(
@@ -102,39 +105,33 @@ class CommandService:
             normal_interval_seconds=normal_interval,
             effective_interval_seconds=effective_interval,
             polling_mode=polling_mode,
+            next_expected_check=self._next_expected_check(
+                state.get("last_check"), normal_interval
+            ),
             channel_health=self._channel_health(),
         )
 
     def _read_state(self) -> dict[str, object]:
-        try:
-            with self._state_path.open("r", encoding="utf-8") as state_file:
-                state = json.load(state_file)
-        except FileNotFoundError:
-            return {"interval": CHECK_INTERVAL_SECONDS}
-        if not isinstance(state, dict):
-            raise ValueError("State file must contain a JSON object")
-        state.setdefault("interval", CHECK_INTERVAL_SECONDS)
-        return state
-
-    def _atomic_write_state(self, state: Mapping[str, object]) -> None:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        file_descriptor, temporary_path = tempfile.mkstemp(
-            prefix=f".{self._state_path.name}.",
-            suffix=".tmp",
-            dir=self._state_path.parent,
+        return read_json_state(
+            self._state_path,
+            defaults={"interval": CHECK_INTERVAL_SECONDS},
         )
+
+    @staticmethod
+    def _next_expected_check(
+        last_check: object, normal_interval: int
+    ) -> str | None:
+        if not isinstance(last_check, str):
+            return None
         try:
-            with os.fdopen(file_descriptor, "w", encoding="utf-8") as state_file:
-                json.dump(state, state_file)
-                state_file.flush()
-                os.fsync(state_file.fileno())
-            os.replace(temporary_path, self._state_path)
-        except BaseException:
-            try:
-                os.unlink(temporary_path)
-            except FileNotFoundError:
-                pass
-            raise
+            last_check_at = datetime.fromisoformat(last_check)
+        except ValueError:
+            return None
+        interval, _ = get_polling_schedule(
+            last_check_at,
+            normal_interval=normal_interval,
+        )
+        return (last_check_at + timedelta(seconds=interval)).isoformat()
 
     def _channel_health(self) -> dict[str, ChannelHealth]:
         return {
@@ -149,7 +146,9 @@ class CommandService:
         if isinstance(health, ChannelHealth):
             return health
         return ChannelHealth(
+            state=str(health.get("state", "healthy")),
             last_delivered_at=health.get("last_delivered_at"),
+            delivered_count=int(health.get("delivered_count", 0)),
             pending_count=int(health.get("pending_count", 0)),
             retrying_count=int(health.get("retrying_count", 0)),
             failed_count=int(health.get("failed_count", 0)),

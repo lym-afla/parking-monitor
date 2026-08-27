@@ -3,13 +3,21 @@
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Mapping, Protocol
+from typing import Awaitable, Callable, Mapping, Protocol
 
 import httpx
 
-from config import STATE_FILE, RuntimeConfig, load_config
+from config import (
+    STATE_FILE,
+    DATABASE_FILE,
+    DiscordDeliveryConfig,
+    RuntimeConfig,
+    TelegramDeliveryConfig,
+    load_discord_delivery_config,
+    load_telegram_delivery_config,
+)
 from notification_store import (
     SUPPORTED_CHANNELS,
     DeliveryClaim,
@@ -19,8 +27,9 @@ from notification_store import (
 
 
 LOGGER = logging.getLogger("parking_notifier")
-DATABASE_PATH = Path(__file__).with_name("notifications.sqlite3")
+DATABASE_PATH = Path(DATABASE_FILE)
 IDLE_SLEEP_SECONDS = 5
+HEALTH_SUMMARY_INTERVAL_SECONDS = 300
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=5.0)
 
 
@@ -68,10 +77,14 @@ def _notification_text(claim: DeliveryClaim) -> str:
 class TelegramAdapter:
     """Send alerts through the Telegram Bot HTTP API."""
 
-    def __init__(self, config: RuntimeConfig, client: httpx.AsyncClient):
+    def __init__(
+        self,
+        config: RuntimeConfig | TelegramDeliveryConfig,
+        client: httpx.AsyncClient,
+    ):
         self._config = config
         self._client = client
-        self._secrets = (config.telegram_bot_token, config.discord_bot_token)
+        self._secrets = (config.telegram_bot_token,)
 
     async def send(self, claim: DeliveryClaim) -> DeliveryResult:
         url = (
@@ -107,10 +120,14 @@ class TelegramAdapter:
 class DiscordAdapter:
     """Send alerts through the Discord bot-authenticated HTTP API."""
 
-    def __init__(self, config: RuntimeConfig, client: httpx.AsyncClient):
+    def __init__(
+        self,
+        config: RuntimeConfig | DiscordDeliveryConfig,
+        client: httpx.AsyncClient,
+    ):
         self._config = config
         self._client = client
-        self._secrets = (config.telegram_bot_token, config.discord_bot_token)
+        self._secrets = (config.discord_bot_token,)
 
     async def send(self, claim: DeliveryClaim) -> DeliveryResult:
         url = (
@@ -179,13 +196,17 @@ class Notifier:
         self,
         store: NotificationStore,
         adapters: Mapping[str, DeliveryAdapter],
+        now_provider: Callable[[], datetime] | None = None,
     ):
         self._store = store
         self._adapters = dict(adapters)
+        self._now_provider = now_provider or (lambda: datetime.now(timezone.utc))
 
     async def run_once(self, now: datetime) -> int:
         attempted = 0
         for channel in SUPPORTED_CHANNELS:
+            if channel not in self._adapters:
+                continue
             try:
                 claim = self._store.claim_due(channel, now)
             except Exception as exc:
@@ -202,15 +223,23 @@ class Notifier:
             try:
                 result = await self._adapters[channel].send(claim)
             except Exception as exc:
-                result = DeliveryResult("retry", str(exc))
+                result = DeliveryResult(
+                    "retry",
+                    self._store.sanitize(exc),
+                )
 
             try:
+                completed_at = self._now_provider()
                 if result.status == "delivered":
-                    self._store.mark_delivered(claim, now)
+                    self._store.mark_delivered(claim, completed_at)
                 elif result.status == "failed":
-                    self._store.mark_failed(claim, result.error or "delivery failed", now)
+                    self._store.mark_failed(
+                        claim, result.error or "delivery failed", completed_at
+                    )
                 elif result.status == "retry":
-                    self._store.mark_retry(claim, result.error or "delivery retry", now)
+                    self._store.mark_retry(
+                        claim, result.error or "delivery retry", completed_at
+                    )
                 else:
                     raise ValueError(f"Unsupported delivery result: {result.status!r}")
                 record = self._store.delivery(claim.event_id, channel)
@@ -235,57 +264,126 @@ class Notifier:
 
 
 def _health_state(health) -> str:
-    if health.failed_count:
-        return "failed"
-    if health.retrying_count:
-        return "retrying"
-    if health.pending_count:
-        return "pending"
-    return "healthy"
+    return health.state
 
 
-def _log_health_transitions(
-    store: NotificationStore, previous: dict[str, str]
-) -> dict[str, str]:
-    current = {
-        channel: _health_state(health)
-        for channel, health in store.health_summary().items()
-    }
-    for channel, state in current.items():
-        old_state = previous.get(channel)
-        if state != old_state:
-            transition = "recovered" if state == "healthy" and old_state else state
+class HealthReporter:
+    """Log immediate state transitions and a bounded periodic health summary."""
+
+    def __init__(self):
+        self._previous: dict[str, str] = {}
+        self._next_summary_at: datetime | None = None
+
+    def report_if_due(self, store: NotificationStore, now: datetime) -> None:
+        health_by_channel = store.health_summary()
+        current = {
+            channel: _health_state(health)
+            for channel, health in health_by_channel.items()
+        }
+        for channel, state in current.items():
+            previous = self._previous.get(channel)
+            if state != previous:
+                transition = "recovered" if state == "healthy" and previous else state
+                LOGGER.info(
+                    "delivery health channel=%s state=%s previous=%s",
+                    channel,
+                    transition,
+                    previous or "unknown",
+                )
+        self._previous = current
+
+        if self._next_summary_at is not None and now < self._next_summary_at:
+            return
+        for channel, health in health_by_channel.items():
             LOGGER.info(
-                "delivery health channel=%s state=%s previous=%s",
+                "delivery health summary channel=%s state=%s delivered=%s "
+                "pending=%s retrying=%s failed=%s",
                 channel,
-                transition,
-                old_state or "unknown",
+                health.state,
+                health.delivered_count,
+                health.pending_count,
+                health.retrying_count,
+                health.failed_count,
             )
-    return current
+        self._next_summary_at = now + timedelta(
+            seconds=HEALTH_SUMMARY_INTERVAL_SECONDS
+        )
 
 
-async def run_forever(config: RuntimeConfig) -> None:
+def initialize_channels(
+    store: NotificationStore,
+    configured_channels: set[str],
+    now: datetime,
+) -> None:
+    """Persist independent channel availability and recover corrected failures."""
+    for channel in SUPPORTED_CHANNELS:
+        enabled = channel in configured_channels
+        store.set_channel_enabled(channel, enabled, now)
+        if enabled:
+            store.requeue_failed(channel, now)
+
+
+async def run_cycle(
+    worker: Notifier,
+    store: NotificationStore,
+    reporter: HealthReporter,
+    *,
+    now: datetime,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+) -> int:
+    """Run one worker/health cycle and idle briefly when no work was due."""
+    attempted = await worker.run_once(now)
+    reporter.report_if_due(store, datetime.now(timezone.utc))
+    if attempted == 0:
+        await sleep(IDLE_SLEEP_SECONDS)
+    return attempted
+
+
+async def run_forever(
+    telegram_config: TelegramDeliveryConfig | None,
+    discord_config: DiscordDeliveryConfig | None,
+) -> None:
     """Initialize migration and continuously drain due channel deliveries."""
-    secrets = (config.telegram_bot_token, config.discord_bot_token)
+    secrets = tuple(
+        value
+        for value in (
+            telegram_config.telegram_bot_token if telegram_config else None,
+            discord_config.discord_bot_token if discord_config else None,
+        )
+        if value
+    )
     store = NotificationStore(DATABASE_PATH, secrets=secrets)
     migrated_event = store.migrate_legacy_alert(STATE_FILE)
     if migrated_event is not None:
         LOGGER.info("migrated legacy alert event_id=%s", migrated_event)
 
-    previous_health: dict[str, str] = {}
+    configured_channels = {
+        channel
+        for channel, config in (
+            ("telegram", telegram_config),
+            ("discord", discord_config),
+        )
+        if config is not None
+    }
+    initialize_channels(store, configured_channels, datetime.now(timezone.utc))
+    reporter = HealthReporter()
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        adapters: dict[str, DeliveryAdapter] = {}
+        if telegram_config is not None:
+            adapters["telegram"] = TelegramAdapter(telegram_config, client)
+        if discord_config is not None:
+            adapters["discord"] = DiscordAdapter(discord_config, client)
         worker = Notifier(
             store,
-            {
-                "telegram": TelegramAdapter(config, client),
-                "discord": DiscordAdapter(config, client),
-            },
+            adapters,
         )
         while True:
-            attempted = await worker.run_once(datetime.now(timezone.utc))
-            previous_health = _log_health_transitions(store, previous_health)
-            if attempted == 0:
-                await asyncio.sleep(IDLE_SLEEP_SECONDS)
+            await run_cycle(
+                worker,
+                store,
+                reporter,
+                now=datetime.now(timezone.utc),
+            )
 
 
 def configure_logging() -> None:
@@ -298,10 +396,20 @@ def configure_logging() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-def main() -> None:
+def main() -> int:
     configure_logging()
-    asyncio.run(run_forever(load_config()))
+    try:
+        asyncio.run(
+            run_forever(
+                load_telegram_delivery_config(),
+                load_discord_delivery_config(),
+            )
+        )
+        return 0
+    except Exception as exc:
+        LOGGER.error("Notifier startup failed error_class=%s", type(exc).__name__)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

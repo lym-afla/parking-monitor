@@ -59,9 +59,13 @@ def status_snapshot():
         normal_interval_seconds=1800,
         effective_interval_seconds=300,
         polling_mode="month-end",
+        next_expected_check="2026-08-27T11:35:00+03:00",
         channel_health={
-            "telegram": ChannelHealth(last_delivered_at="2026-08-27T11:00:00+03:00"),
-            "discord": ChannelHealth(pending_count=1),
+            "telegram": ChannelHealth(
+                last_delivered_at="2026-08-27T11:00:00+03:00",
+                delivered_count=4,
+            ),
+            "discord": ChannelHealth(state="disabled", pending_count=1),
         },
     )
 
@@ -112,6 +116,9 @@ class DiscordAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         request.response.send_message.assert_awaited_once()
         args, kwargs = request.response.send_message.await_args
         self.assertIn("Parking Monitor Status", args[0])
+        self.assertIn("Next Expected Check", args[0])
+        self.assertIn("delivered 4", args[0])
+        self.assertIn("disabled", args[0].lower())
         self.assertTrue(kwargs["ephemeral"])
 
     async def test_stats_uses_shared_service_and_ephemeral_response(self):
@@ -283,16 +290,53 @@ class DiscordStartupTests(unittest.TestCase):
         discord_http_logger.setLevel(logging.NOTSET)
 
         with (
-            patch("discord_bot.load_config", return_value=runtime_config()),
+            patch(
+                "discord_bot.load_discord_command_config",
+                return_value=runtime_config(),
+            ),
             patch("discord_bot.NotificationStore") as store_type,
             patch("discord_bot.CommandService"),
             patch("discord_bot.build_bot", return_value=bot),
         ):
             store_type.return_value.health_summary = MagicMock()
-            main()
+            exit_code = main()
 
+        self.assertEqual(exit_code, 0)
         bot.run.assert_called_once_with("discord-test-token", log_handler=None)
         self.assertFalse(discord_http_logger.isEnabledFor(logging.WARNING))
+
+    def test_startup_exception_logs_only_class_and_generic_message(self):
+        secret = "ABCDEFGHIJKLMNOPQRSTUVWX.abcdef.startupExceptionMustNeverReachLogs"
+        bot = SimpleNamespace(run=MagicMock(side_effect=RuntimeError(secret)))
+
+        with (
+            patch(
+                "discord_bot.load_discord_command_config",
+                return_value=runtime_config(),
+            ),
+            patch("discord_bot.NotificationStore") as store_type,
+            patch("discord_bot.CommandService"),
+            patch("discord_bot.build_bot", return_value=bot),
+            self.assertLogs("parking_discord_bot", level="ERROR") as captured,
+        ):
+            store_type.return_value.health_summary = MagicMock()
+            exit_code = main()
+
+        output = "\n".join(captured.output)
+        self.assertEqual(exit_code, 1)
+        self.assertIn("RuntimeError", output)
+        self.assertIn("startup failed", output.lower())
+        self.assertNotIn(secret, output)
+
+    def test_missing_discord_configuration_disables_only_this_service(self):
+        with (
+            patch("discord_bot.load_discord_command_config", return_value=None),
+            patch("discord_bot.NotificationStore") as store_type,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        store_type.assert_not_called()
 
 
 if __name__ == "__main__":
