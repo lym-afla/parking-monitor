@@ -39,6 +39,32 @@ def _bash_path(path: Path) -> str:
     return f"/{drive}/{tail}"
 
 
+class RepositoryModeTests(unittest.TestCase):
+    def test_service_scripts_are_committed_executable(self):
+        tracked_scripts = (
+            "scripts/setup-service.sh",
+            "scripts/manage-parking-monitor.sh",
+        )
+        result = subprocess.run(
+            ["git", "ls-files", "-s", "--", *tracked_scripts],
+            cwd=PROJECT_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        tracked_modes = {}
+        for line in result.stdout.splitlines():
+            metadata, path = line.split("\t", 1)
+            tracked_modes[path] = metadata.split()[0]
+
+        self.assertEqual(
+            tracked_modes,
+            {script: "100755" for script in tracked_scripts},
+        )
+
+
 class ServiceTemplateTests(unittest.TestCase):
     def setUp(self):
         self._temporary_directory = tempfile.TemporaryDirectory()
