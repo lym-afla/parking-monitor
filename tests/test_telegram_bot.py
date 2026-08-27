@@ -1,0 +1,158 @@
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+from command_service import ChannelHealth, StatsSnapshot, StatusSnapshot
+from config import RuntimeConfig
+from telegram_bot import TelegramHandlers, is_authorized, prepare_telegram_application
+
+
+AUTHORIZED_USER_ID = 404346140
+AUTHORIZED_CHAT_ID = 404346140
+
+
+def runtime_config():
+    return RuntimeConfig(
+        telegram_bot_token="test-token",
+        telegram_chat_id=AUTHORIZED_CHAT_ID,
+        telegram_authorized_user_id=AUTHORIZED_USER_ID,
+        discord_bot_token="test-discord-token",
+        discord_application_id=1,
+        discord_guild_id=2,
+        discord_channel_id=3,
+        discord_authorized_user_id=4,
+    )
+
+
+def telegram_update(user_id=AUTHORIZED_USER_ID, chat_id=AUTHORIZED_CHAT_ID):
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=chat_id),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+        callback_query=None,
+    )
+
+
+def callback_update(data, user_id=AUTHORIZED_USER_ID, chat_id=AUTHORIZED_CHAT_ID):
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=chat_id),
+        message=None,
+        callback_query=SimpleNamespace(
+            data=data,
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        ),
+    )
+
+
+def status_snapshot():
+    return StatusSnapshot(
+        last_check="2026-08-27T11:30:00+03:00",
+        parking_available=False,
+        normal_interval_seconds=1800,
+        effective_interval_seconds=300,
+        polling_mode="month-end",
+        channel_health={
+            "telegram": ChannelHealth(last_delivered_at="2026-08-27T11:00:00+03:00"),
+            "discord": ChannelHealth(pending_count=1),
+        },
+    )
+
+
+def stats_snapshot():
+    return StatsSnapshot(
+        checks=12,
+        hits=3,
+        success_rate_percent=25.0,
+        last_check="2026-08-27T11:30:00+03:00",
+        channel_health={"telegram": ChannelHealth(), "discord": ChannelHealth()},
+    )
+
+
+class TelegramAuthorizationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.config = runtime_config()
+        self.command_service = MagicMock()
+        self.command_service.status.return_value = status_snapshot()
+        self.command_service.stats.return_value = stats_snapshot()
+        self.command_service.set_normal_interval.return_value = status_snapshot()
+        self.handlers = TelegramHandlers(self.command_service, self.config)
+
+    def test_authorization_requires_exact_user_and_chat(self):
+        self.assertTrue(is_authorized(telegram_update(), self.config))
+        self.assertFalse(
+            is_authorized(telegram_update(user_id=999), self.config)
+        )
+        self.assertFalse(
+            is_authorized(telegram_update(chat_id=999), self.config)
+        )
+
+    async def test_unauthorized_command_does_not_read_state_or_reply(self):
+        update = telegram_update(user_id=999, chat_id=999)
+
+        await self.handlers.status(update, SimpleNamespace(args=[]))
+
+        self.command_service.status.assert_not_called()
+        update.message.reply_text.assert_not_awaited()
+
+    async def test_authorized_command_uses_shared_status(self):
+        update = telegram_update()
+
+        await self.handlers.status(update, SimpleNamespace(args=[]))
+
+        self.command_service.status.assert_called_once_with()
+        update.message.reply_text.assert_awaited_once()
+
+    async def test_unauthorized_callback_is_acknowledged_without_state_or_data(self):
+        update = callback_update("stats", user_id=999)
+
+        await self.handlers.callback(update, SimpleNamespace(args=[]))
+
+        update.callback_query.answer.assert_awaited_once_with()
+        update.callback_query.edit_message_text.assert_not_awaited()
+        self.command_service.stats.assert_not_called()
+
+    async def test_authorized_status_and_stats_callbacks_use_shared_service(self):
+        status_update = callback_update("status")
+        stats_update = callback_update("stats")
+
+        await self.handlers.callback(status_update, SimpleNamespace(args=[]))
+        await self.handlers.callback(stats_update, SimpleNamespace(args=[]))
+
+        self.command_service.status.assert_called_once_with()
+        self.command_service.stats.assert_called_once_with()
+        status_update.callback_query.edit_message_text.assert_awaited_once()
+        stats_update.callback_query.edit_message_text.assert_awaited_once()
+
+    async def test_interval_command_reads_and_updates_through_shared_service(self):
+        view_update = telegram_update()
+        set_update = telegram_update()
+
+        await self.handlers.interval(view_update, SimpleNamespace(args=[]))
+        await self.handlers.interval(set_update, SimpleNamespace(args=["900"]))
+
+        self.command_service.status.assert_called_once_with()
+        self.command_service.set_normal_interval.assert_called_once_with(900)
+        view_update.message.reply_text.assert_awaited_once()
+        set_update.message.reply_text.assert_awaited_once()
+
+    async def test_unauthorized_start_is_silent(self):
+        update = telegram_update(chat_id=999)
+
+        await self.handlers.start(update, SimpleNamespace(args=[]))
+
+        update.message.reply_text.assert_not_awaited()
+
+
+class TelegramStartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_deletes_stale_webhook_before_polling(self):
+        app = SimpleNamespace(bot=SimpleNamespace(delete_webhook=AsyncMock()))
+
+        await prepare_telegram_application(app)
+
+        app.bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,464 +1,324 @@
-import json
-import asyncio
-from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from config import *
+"""Private Telegram command front end for the parking monitor."""
 
-# ---------- State helpers ----------
+import logging
+from pathlib import Path
 
-def load_state():
-    try:
-        with open(STATE_FILE, "r") as f:
-            state = json.load(f)
-            # Ensure interval has a default value if not present
-            if "interval" not in state:
-                state["interval"] = CHECK_INTERVAL_SECONDS
-            return state
-    except:
-        return {"interval": CHECK_INTERVAL_SECONDS}
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-def save_state(s):
-    with open(STATE_FILE, "w") as f:
-        json.dump(s, f)
+from command_service import ChannelHealth, CommandService, StatsSnapshot, StatusSnapshot
+from config import STATE_FILE, RuntimeConfig, load_config
+from notification_store import NotificationStore
 
-# ---------- Helper functions ----------
 
-def create_main_keyboard():
-    """Create the main inline keyboard"""
-    keyboard = [
+LOGGER = logging.getLogger("parking_telegram_bot")
+DATABASE_PATH = Path(__file__).with_name("notifications.sqlite3")
+
+
+def is_authorized(update: Update, config: RuntimeConfig) -> bool:
+    """Return whether an update is from the one allowed user in the allowed chat."""
+    user = update.effective_user
+    chat = update.effective_chat
+    return bool(
+        user
+        and chat
+        and user.id == config.telegram_authorized_user_id
+        and chat.id == config.telegram_chat_id
+    )
+
+
+def create_main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("📊 Status", callback_data="status"),
-            InlineKeyboardButton("📈 Statistics", callback_data="stats"),
-        ],
-        [
-            InlineKeyboardButton("⚙️ Set Interval", callback_data="interval_menu"),
-            InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
-        ],
-        [
-            InlineKeyboardButton("⚡ Quick Intervals", callback_data="quick_intervals"),
+            [
+                InlineKeyboardButton("📊 Status", callback_data="status"),
+                InlineKeyboardButton("📈 Statistics", callback_data="stats"),
+            ],
+            [
+                InlineKeyboardButton("⚙️ Set Interval", callback_data="interval_menu"),
+                InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
+            ],
+            [InlineKeyboardButton("⚡ Quick Intervals", callback_data="quick_intervals")],
         ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    )
 
-def create_interval_keyboard():
-    """Create interval selection keyboard"""
-    keyboard = [
+
+def create_interval_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("1 min", callback_data="set_interval_60"),
-            InlineKeyboardButton("2 min", callback_data="set_interval_120"),
-            InlineKeyboardButton("5 min", callback_data="set_interval_300"),
-        ],
-        [
-            InlineKeyboardButton("10 min", callback_data="set_interval_600"),
-            InlineKeyboardButton("15 min", callback_data="set_interval_900"),
-            InlineKeyboardButton("30 min", callback_data="set_interval_1800"),
-        ],
-        [
-            InlineKeyboardButton("⬅️ Back", callback_data="back_main"),
+            [
+                InlineKeyboardButton("1 min", callback_data="set_interval_60"),
+                InlineKeyboardButton("2 min", callback_data="set_interval_120"),
+                InlineKeyboardButton("5 min", callback_data="set_interval_300"),
+            ],
+            [
+                InlineKeyboardButton("10 min", callback_data="set_interval_600"),
+                InlineKeyboardButton("15 min", callback_data="set_interval_900"),
+                InlineKeyboardButton("30 min", callback_data="set_interval_1800"),
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back_main")],
         ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    )
 
-def format_interval(seconds):
-    """Format interval in seconds to human-readable format"""
+
+def format_interval(seconds: int) -> str:
     if seconds < 60:
         return f"{seconds} seconds"
-    elif seconds < 3600:
+    if seconds < 3600:
         minutes = seconds // 60
         return f"{minutes} minute{'s' if minutes != 1 else ''}"
-    elif seconds < 86400:
+    if seconds < 86400:
         hours = seconds // 3600
-        remaining_minutes = (seconds % 3600) // 60
-        if remaining_minutes == 0:
-            return f"{hours} hour{'s' if hours != 1 else ''}"
-        else:
-            return f"{hours}h {remaining_minutes}m"
-    else:
-        days = seconds // 86400
-        remaining_hours = (seconds % 86400) // 3600
-        if remaining_hours == 0:
-            return f"{days} day{'s' if days != 1 else ''}"
-        else:
-            return f"{days}d {remaining_hours}h"
+        minutes = (seconds % 3600) // 60
+        if minutes:
+            return f"{hours}h {minutes}m"
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    if hours:
+        return f"{days}d {hours}h"
+    return f"{days} day{'s' if days != 1 else ''}"
 
-def format_datetime(iso_string):
-    """Format ISO datetime string to friendly format"""
-    if iso_string == 'Never' or not iso_string:
-        return 'Never'
 
-    try:
-        from datetime import datetime
-        dt = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
-
-        # Format: "Jan 17, 2024 at 2:30 PM"
-        friendly_format = dt.strftime("%b %d, %Y at %I:%M %p")
-        return friendly_format
-    except:
-        return iso_string
-
-def format_relative_time(iso_string):
-    """Format ISO datetime string to relative time"""
-    if iso_string == 'Never' or not iso_string:
-        return 'Never'
-
-    try:
-        from datetime import datetime
-        dt = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
-        now = datetime.now(dt.tzinfo)
-
-        diff = now - dt
-
-        if diff.total_seconds() < 60:
-            return "Just now"
-        elif diff.total_seconds() < 3600:
-            minutes = int(diff.total_seconds() / 60)
-            return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
-        elif diff.total_seconds() < 86400:
-            hours = int(diff.total_seconds() / 3600)
-            return f"{hours} hour{'s' if hours != 1 else ''} ago"
-        else:
-            days = diff.days
-            return f"{days} day{'s' if days != 1 else ''} ago"
-    except:
-        return iso_string
-
-def format_status_message(state):
-    """Format status message"""
-    last_enabled = state.get('last_enabled', False)
-    status_icon = "✅ Available" if last_enabled else "❌ Occupied"
-    last_check = state.get('last_check', 'Never')
-    interval = state.get('interval', 60)
-
-    # Calculate success rate
-    checks = state.get('checks', 0)
-    hits = state.get('hits', 0)
-    success_rate = (hits / checks * 100) if checks > 0 else 0
-
-    # Format last check time
-    last_check_friendly = format_datetime(last_check)
-    last_check_relative = format_relative_time(last_check)
-
-    message = (
-        f"🅿️ *Parking Monitor Status*\n\n"
-        f"📊 *Current Status:* {status_icon}\n"
-        f"🕐 *Last Check:* {last_check_friendly}\n"
-        f"⏰ *{last_check_relative}*\n"
-        f"⏱️ *Check Interval:* {format_interval(interval)}\n"
-        f"📈 *Success Rate:* {success_rate:.1f}% ({hits}/{checks})\n"
+def _health_line(channel: str, health: ChannelHealth) -> str:
+    last_delivery = health.last_delivered_at or "Never"
+    return (
+        f"*{channel.title()}:* last {last_delivery}; "
+        f"pending {health.pending_count}, retrying {health.retrying_count}, "
+        f"failed {health.failed_count}"
     )
 
-    return message
 
-def format_stats_message(state):
-    """Format statistics message"""
-    checks = state.get('checks', 0)
-    hits = state.get('hits', 0)
-    interval = state.get('interval', 60)
-
-    # Calculate additional stats
-    success_rate = (hits / checks * 100) if checks > 0 else 0
-    uptime_hours = checks * interval / 3600  # Approximate hours of monitoring
-
-    # Format uptime nicely
-    if uptime_hours < 1:
-        uptime_minutes = int(uptime_hours * 60)
-        uptime_str = f"{uptime_minutes} minute{'s' if uptime_minutes != 1 else ''}"
-    elif uptime_hours < 24:
-        uptime_str = f"{uptime_hours:.1f} hour{'s' if uptime_hours != 1 else ''}"
-    else:
-        days = int(uptime_hours / 24)
-        remaining_hours = uptime_hours % 24
-        if remaining_hours == 0:
-            uptime_str = f"{days} day{'s' if days != 1 else ''}"
-        else:
-            uptime_str = f"{days}d {remaining_hours:.0f}h"
-
-    message = (
-        f"📊 *Parking Monitor Statistics*\n\n"
-        f"🔍 *Total Checks:* {checks:,}\n"
-        f"🎯 *Successful Alerts:* {hits:,}\n"
-        f"📈 *Success Rate:* {success_rate:.1f}%\n"
-        f"⏱️ *Check Interval:* {format_interval(interval)}\n"
-        f"⏰ *Monitoring Uptime:* {uptime_str}\n"
+def _health_lines(health_by_channel) -> str:
+    if not health_by_channel:
+        return "*Notifications:* No delivery history"
+    return "\n".join(
+        _health_line(channel, health)
+        for channel, health in sorted(health_by_channel.items())
     )
 
-    return message
 
-# ---------- Command handlers ----------
+def format_status_message(status: StatusSnapshot) -> str:
+    availability = "✅ Available" if status.parking_available else "❌ Occupied"
+    return (
+        "🅿️ *Parking Monitor Status*\n\n"
+        f"📊 *Current Status:* {availability}\n"
+        f"🕐 *Last Check:* {status.last_check or 'Never'}\n"
+        f"🔄 *Polling Mode:* {status.polling_mode}\n"
+        f"⏱️ *Active Interval:* {format_interval(status.effective_interval_seconds)}\n"
+        f"⚙️ *Normal Interval:* {format_interval(status.normal_interval_seconds)}\n\n"
+        f"{_health_lines(status.channel_health)}"
+    )
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
-    welcome_message = (
+
+def format_stats_message(stats: StatsSnapshot) -> str:
+    return (
+        "📊 *Parking Monitor Statistics*\n\n"
+        f"🔍 *Total Checks:* {stats.checks:,}\n"
+        f"🎯 *Availability Hits:* {stats.hits:,}\n"
+        f"📈 *Hit Rate:* {stats.success_rate_percent:.1f}%\n"
+        f"🕐 *Last Check:* {stats.last_check or 'Never'}\n\n"
+        f"{_health_lines(stats.channel_health)}"
+    )
+
+
+def _welcome_message() -> str:
+    return (
         "🤖 *Parking Monitor Bot*\n\n"
-        "I monitor Moscow parking availability and alert you when spots become available!\n\n"
+        "I monitor Moscow parking availability and alert you when spots "
+        "become available!\n\n"
         "Use the buttons below or these commands:\n"
         "/status - Check current status\n"
         "/stats - View statistics\n"
-        "/interval <seconds> - Set check interval"
+        "/interval <seconds> - View or set the normal check interval"
     )
 
-    await update.message.reply_text(
-        welcome_message,
-        reply_markup=create_main_keyboard(),
-        parse_mode="Markdown"
-    )
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /status command"""
-    s = load_state()
-    message = format_status_message(s)
-    await update.message.reply_text(
-        message,
-        reply_markup=create_main_keyboard(),
-        parse_mode="Markdown"
-    )
+class TelegramHandlers:
+    """Authorized Telegram handlers backed by the shared command service."""
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /stats command"""
-    s = load_state()
-    message = format_stats_message(s)
-    await update.message.reply_text(
-        message,
-        reply_markup=create_main_keyboard(),
-        parse_mode="Markdown"
-    )
+    def __init__(self, command_service: CommandService, config: RuntimeConfig):
+        self._command_service = command_service
+        self._config = config
 
-async def interval_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /interval command"""
-    if not context.args:
-        await update.message.reply_text(
-            "⚙️ *Set Check Interval*\n\n"
-            "Please specify the interval in seconds (minimum 60):\n"
-            "/interval <seconds>\n\n"
-            "Or use the ⚡ Quick Intervals button for preset options.",
-            reply_markup=create_main_keyboard(),
-            parse_mode="Markdown"
+    def _authorize(self, update: Update, action: str) -> bool:
+        if is_authorized(update, self._config):
+            return True
+        user_id = getattr(update.effective_user, "id", None)
+        chat_id = getattr(update.effective_chat, "id", None)
+        LOGGER.warning(
+            "Rejected Telegram action=%s user_id=%s chat_id=%s",
+            action,
+            user_id,
+            chat_id,
         )
-        return
+        return False
 
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorize(update, "start"):
+            return
+        await update.message.reply_text(
+            _welcome_message(),
+            reply_markup=create_main_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorize(update, "status"):
+            return
+        message = format_status_message(self._command_service.status())
+        await update.message.reply_text(
+            message,
+            reply_markup=create_main_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorize(update, "stats"):
+            return
+        message = format_stats_message(self._command_service.stats())
+        await update.message.reply_text(
+            message,
+            reply_markup=create_main_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    async def interval(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorize(update, "interval"):
+            return
+        if not context.args:
+            status = self._command_service.status()
+            message = (
+                "⚙️ *Set Normal Check Interval*\n\n"
+                f"Current normal interval: {format_interval(status.normal_interval_seconds)}\n"
+                f"Active interval: {format_interval(status.effective_interval_seconds)} "
+                f"({status.polling_mode})\n\n"
+                "Use /interval <seconds> or choose a preset below."
+            )
+            reply_markup = create_interval_keyboard()
+        else:
+            try:
+                seconds = int(context.args[0])
+                status = self._command_service.set_normal_interval(seconds)
+            except (TypeError, ValueError):
+                await update.message.reply_text(
+                    "❌ *Invalid Interval*\n\n"
+                    "Enter a whole number from 60 through 86400 seconds.",
+                    reply_markup=create_main_keyboard(),
+                    parse_mode="Markdown",
+                )
+                return
+            message = (
+                "✅ *Interval Updated*\n\n"
+                "Normal check interval set to "
+                f"{format_interval(status.normal_interval_seconds)}."
+            )
+            reply_markup = create_main_keyboard()
+        await update.message.reply_text(
+            message,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+
+    async def callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not self._authorize(update, "callback"):
+            await query.answer()
+            return
+
+        await query.answer()
+        data = query.data
+        if data in ("status", "refresh"):
+            await self._edit_callback(
+                query,
+                format_status_message(self._command_service.status()),
+                create_main_keyboard(),
+            )
+        elif data == "stats":
+            await self._edit_callback(
+                query,
+                format_stats_message(self._command_service.stats()),
+                create_main_keyboard(),
+            )
+        elif data in ("interval_menu", "quick_intervals"):
+            status = self._command_service.status()
+            message = (
+                "⚙️ *Set Normal Check Interval*\n\n"
+                f"Current normal interval: {format_interval(status.normal_interval_seconds)}\n\n"
+                "Choose a preset interval:"
+            )
+            await self._edit_callback(query, message, create_interval_keyboard())
+        elif data.startswith("set_interval_"):
+            try:
+                seconds = int(data.removeprefix("set_interval_"))
+                status = self._command_service.set_normal_interval(seconds)
+            except (TypeError, ValueError):
+                message = "❌ *Invalid Interval*"
+            else:
+                message = (
+                    "✅ *Interval Updated*\n\n"
+                    "Normal check interval set to "
+                    f"{format_interval(status.normal_interval_seconds)}."
+                )
+            await self._edit_callback(query, message, create_main_keyboard())
+        elif data == "back_main":
+            await self._edit_callback(
+                query,
+                "🤖 *Parking Monitor Bot*\n\nWhat would you like to do?",
+                create_main_keyboard(),
+            )
+
+    @staticmethod
+    async def _edit_callback(query, message: str, reply_markup) -> None:
+        try:
+            await query.edit_message_text(
+                text=message,
+                reply_markup=reply_markup,
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+
+
+async def prepare_telegram_application(application: Application) -> None:
+    """Discard stale webhook updates before long polling starts."""
     try:
-        new_interval = max(60, int(context.args[0]))
-        s = load_state()
-        s["interval"] = new_interval
-        save_state(s)
+        await application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as exc:
+        LOGGER.error("Telegram webhook reset failed: %s", type(exc).__name__)
+        raise
+    LOGGER.info("Telegram webhook reset completed")
 
-        await update.message.reply_text(
-            f"✅ *Interval Updated*\n\n"
-            f"Check interval set to {format_interval(new_interval)}",
-            reply_markup=create_main_keyboard(),
-            parse_mode="Markdown"
-        )
-    except:
-        await update.message.reply_text(
-            "❌ *Invalid Number*\n\n"
-            "Please enter a valid number of seconds (minimum 60).",
-            reply_markup=create_main_keyboard(),
-            parse_mode="Markdown"
-        )
 
-# ---------- Callback query handlers ----------
+def build_application(config: RuntimeConfig, command_service: CommandService) -> Application:
+    handlers = TelegramHandlers(command_service, config)
+    application = (
+        Application.builder()
+        .token(config.telegram_bot_token)
+        .post_init(prepare_telegram_application)
+        .build()
+    )
+    application.add_handler(CommandHandler("start", handlers.start))
+    application.add_handler(CommandHandler("status", handlers.status))
+    application.add_handler(CommandHandler("stats", handlers.stats))
+    application.add_handler(CommandHandler("interval", handlers.interval))
+    application.add_handler(CallbackQueryHandler(handlers.callback))
+    return application
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button presses"""
-    query = update.callback_query
-    await query.answer()  # Acknowledge the button press
 
-    data = query.data
-    s = load_state()
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    config = load_config()
+    store = NotificationStore(
+        DATABASE_PATH,
+        secrets=(config.telegram_bot_token, config.discord_bot_token),
+    )
+    command_service = CommandService(STATE_FILE, health_provider=store.health_summary)
+    application = build_application(config, command_service)
+    LOGGER.info("Telegram polling starting")
+    application.run_polling()
 
-    if data == "status":
-        message = format_status_message(s)
-        try:
-            await query.edit_message_text(
-                text=message,
-                reply_markup=create_main_keyboard(),
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            # Ignore "message is not modified" error
-            if "message is not modified" not in str(e).lower():
-                raise
-
-    elif data == "stats":
-        message = format_stats_message(s)
-        try:
-            await query.edit_message_text(
-                text=message,
-                reply_markup=create_main_keyboard(),
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            # Ignore "message is not modified" error
-            if "message is not modified" not in str(e).lower():
-                raise
-
-    elif data == "interval_menu":
-        current_interval = s.get('interval', 60)
-        message = (
-            f"⚙️ *Set Check Interval*\n\n"
-            f"Current interval: {format_interval(current_interval)}\n\n"
-            f"Choose a preset interval:"
-        )
-        try:
-            await query.edit_message_text(
-                text=message,
-                reply_markup=create_interval_keyboard(),
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            if "message is not modified" not in str(e).lower():
-                raise
-
-    elif data == "quick_intervals":
-        message = (
-            "⚡ *Quick Interval Settings*\n\n"
-            "Choose from common intervals or use custom settings:"
-        )
-        try:
-            await query.edit_message_text(
-                text=message,
-                reply_markup=create_interval_keyboard(),
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            if "message is not modified" not in str(e).lower():
-                raise
-
-    elif data.startswith("set_interval_"):
-        # Extract interval from callback data
-        interval = int(data.split("_")[2])
-        s["interval"] = interval
-        save_state(s)
-
-        message = (
-            f"✅ *Interval Updated*\n\n"
-            f"Check interval set to {format_interval(interval)}"
-        )
-        try:
-            await query.edit_message_text(
-                text=message,
-                reply_markup=create_main_keyboard(),
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            if "message is not modified" not in str(e).lower():
-                raise
-
-    elif data == "refresh":
-        # Just refresh current status
-        message = format_status_message(s)
-        try:
-            await query.edit_message_text(
-                text=message,
-                reply_markup=create_main_keyboard(),
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            if "message is not modified" not in str(e).lower():
-                raise
-
-    elif data == "back_main":
-        message = (
-            "🤖 *Parking Monitor Bot*\n\n"
-            "What would you like to do?"
-        )
-        try:
-            await query.edit_message_text(
-                text=message,
-                reply_markup=create_main_keyboard(),
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            if "message is not modified" not in str(e).lower():
-                raise
-
-# ---------- Background alert task ----------
-
-def start_alert_task(application: Application):
-    """Start the alert task in a separate thread"""
-    import threading
-
-    def alert_worker():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        async def run_alerts():
-            while True:
-                try:
-                    s = load_state()
-                    if s.get("alert"):
-                        # Send alert with inline keyboard
-                        alert_keyboard = InlineKeyboardMarkup([
-                            [
-                                InlineKeyboardButton("📊 Check Status", callback_data="status"),
-                                InlineKeyboardButton("📈 View Stats", callback_data="stats"),
-                            ]
-                        ])
-
-                        await application.bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=(
-                                "🚨 *PARKING AVAILABLE!*\n\n"
-                                "A parking spot has become available!\n"
-                                "Click below to check current status:"
-                            ),
-                            reply_markup=alert_keyboard,
-                            parse_mode="Markdown"
-                        )
-
-                        s["alert"] = False
-                        save_state(s)
-                    if s.get("error"):
-                        await application.bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=f"❌ Error: {s['error']}"
-                        )
-                        s["error"] = None
-                        save_state(s)
-
-                    await asyncio.sleep(5)
-                except Exception as e:
-                    print(f"Alert task error: {e}")
-                    await asyncio.sleep(5)
-
-        loop.run_until_complete(run_alerts())
-
-    # Start the alert worker thread
-    alert_thread = threading.Thread(target=alert_worker, daemon=True)
-    alert_thread.start()
-    return alert_thread
-
-# ---------- Main ----------
-
-def main():
-    print("Starting Telegram bot...")
-    print(f"Bot token: {TELEGRAM_BOT_TOKEN[:20]}...")
-    print(f"Chat ID: {TELEGRAM_CHAT_ID}")
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # Command handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("interval", interval_command))
-
-    # Callback query handler for inline buttons
-    app.add_handler(CallbackQueryHandler(button_callback))
-
-    # Start the alert task in background
-    print("Starting alert task...")
-    start_alert_task(app)
-
-    # Run the application
-    try:
-        print("Running bot application...")
-        # Run the bot with polling - this will handle updates continuously
-        app.run_polling(drop_pending_updates=True)
-    except Exception as e:
-        print(f"Bot error: {e}")
-        import traceback
-        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
