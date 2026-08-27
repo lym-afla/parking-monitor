@@ -3,11 +3,14 @@ import json
 import sys
 import calendar
 from datetime import datetime, time as datetime_time, timedelta, timezone
+from pathlib import Path
 from playwright.sync_api import sync_playwright
 from config import *
 
 MOSCOW_TIMEZONE = timezone(timedelta(hours=3), "MSK")
 MONTH_END_INTERVAL_SECONDS = 300
+DATABASE_PATH = Path(__file__).with_name("notifications.sqlite3")
+NOTIFICATION_CHANNELS = ("telegram", "discord")
 
 
 def get_polling_schedule(now=None, normal_interval=CHECK_INTERVAL_SECONDS):
@@ -61,6 +64,27 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
+
+def apply_check_result(state, enabled, store):
+    """Apply one completed scrape and durably queue an availability transition."""
+    state["checks"] = state.get("checks", 0) + 1
+    state["last_check"] = datetime.now().isoformat()
+
+    if enabled and not state.get("last_enabled", False):
+        source_check = state["checks"]
+        store.create_event(
+            "parking_available",
+            {"available": True},
+            source_check,
+            NOTIFICATION_CHANNELS,
+            event_key=f"parking-available:check:{source_check}",
+        )
+        state["hits"] = state.get("hits", 0) + 1
+
+    state["last_enabled"] = enabled
+    state["error"] = None
+    return state
+
 def check_site():
     log("Starting website check...")
     with sync_playwright() as p:
@@ -102,12 +126,15 @@ def check_site():
         return enabled
 
 def main():
+    from notification_store import NotificationStore
+
     log("=== Parking Monitor Service Started ===")
     log(f"State file: {STATE_FILE}")
     log(f"Target: {TARGET_ADDRESS_TEXT}, {TARGET_REGION_TEXT}")
 
     initial_state = load_state()
     log(f"Loaded state: checks={initial_state.get('checks', 0)}, hits={initial_state.get('hits', 0)}, interval={initial_state.get('interval', CHECK_INTERVAL_SECONDS)}s")
+    store = NotificationStore(DATABASE_PATH)
 
     while True:
         try:
@@ -115,16 +142,10 @@ def main():
             state = load_state()
 
             enabled = check_site()
-            state["checks"] += 1
-            state["last_check"] = datetime.now().isoformat()
-
-            if enabled and not state["last_enabled"]:
-                log("🚨 PARKING BECAME AVAILABLE! Setting alert flag.")
-                state["hits"] += 1
-                state["alert"] = True
-
-            state["last_enabled"] = enabled
-            state["error"] = None
+            was_enabled = state.get("last_enabled", False)
+            apply_check_result(state, enabled, store)
+            if enabled and not was_enabled:
+                log("🚨 PARKING BECAME AVAILABLE! Notification event queued.")
             save_state(state)
 
 
