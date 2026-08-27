@@ -1,6 +1,6 @@
 #!/bin/bash
 # Service Setup Script for Parking Monitor
-# Creates user, sets permissions, creates symlink, and configures systemd service
+# Creates user, sets permissions, creates symlink, and configures systemd services
 
 # Configuration
 SERVICE_NAME="parking-service"
@@ -132,8 +132,7 @@ setup_permissions() {
     # Ensure management script is executable
     chmod +x "$APP_DIR/scripts/manage-parking-monitor.sh"
 
-    # Secure sensitive files
-    chmod 600 "$APP_DIR/.env" 2>/dev/null || true
+    # Runtime secrets live outside the application tree and are never changed here.
     chmod 700 "$CONFIG_DIR" 2>/dev/null || true
 
     # Configure git for server deployment
@@ -156,105 +155,87 @@ setup_permissions() {
     print_status "File permissions configured"
 }
 
-# Create systemd service files
+# Render one systemd service file. The systemd manager opens EnvironmentFile
+# before dropping privileges, so the service account never needs read access to
+# the root:root mode 0600 secret file itself.
+render_service_unit() {
+    local output_directory="$1"
+    local component="$2"
+    local description="$3"
+    local program="$4"
+    local log_name="$5"
+    local unit_path="${output_directory}/${SERVICE_NAME}-${component}.service"
+
+    cat > "$unit_path" << EOF
+[Unit]
+Description=${description}
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=${APP_USER}
+Group=${APP_USER}
+WorkingDirectory=${APP_DIR}
+Environment=PATH=${APP_DIR}/venv/bin
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/parking-monitor.env
+ExecStart=${APP_DIR}/venv/bin/python ${APP_DIR}/${program}
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:${LOG_DIR}/${log_name}
+StandardError=append:${LOG_DIR}/${log_name}
+UMask=0077
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+ReadWritePaths=${APP_DIR}
+EOF
+
+    cat >> "$unit_path" << EOF
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# Render the exact four units without requiring root. The installer uses this
+# same function so tests exercise the output that is actually installed.
+render_service_files() {
+    local output_directory="$1"
+    mkdir -p "$output_directory"
+
+    render_service_unit "$output_directory" monitor \
+        "Parking Monitor - Web Scraper" monitor.py monitor.log
+    render_service_unit "$output_directory" notifier \
+        "Parking Monitor - Notification Delivery Worker" notifier.py notifier.log
+    render_service_unit "$output_directory" bot \
+        "Parking Monitor - Private Telegram Bot" telegram_bot.py telegram.log
+    render_service_unit "$output_directory" discord \
+        "Parking Monitor - Private Discord Bot" discord_bot.py discord.log
+}
+
+# Create systemd service files.
 create_service_file() {
     print_header "Creating systemd service files..."
-
-    # Create Monitor Service
-    cat > "/etc/systemd/system/${SERVICE_NAME}-monitor.service" << EOF
-[Unit]
-Description=Parking Monitor - Web Scraper
-After=network.target
-PartOf=${SERVICE_NAME}.service
-
-[Service]
-Type=simple
-User=${APP_USER}
-Group=${APP_USER}
-WorkingDirectory=${APP_DIR}
-Environment=PATH=${APP_DIR}/venv/bin
-ExecStart=${APP_DIR}/venv/bin/python ${APP_DIR}/monitor.py
-EnvironmentFile=${APP_DIR}/.env
-Restart=on-failure
-RestartSec=10
-StandardOutput=append:${LOG_DIR}/monitor.log
-StandardError=append:${LOG_DIR}/monitor.log
-
-# Security settings
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=${APP_DIR}
-ReadWritePaths=${LOG_DIR}
-ReadWritePaths=${CONFIG_DIR}
-PrivateDevices=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # Create Telegram Bot Service
-    cat > "/etc/systemd/system/${SERVICE_NAME}-bot.service" << EOF
-[Unit]
-Description=Parking Monitor - Telegram Bot
-After=network.target
-PartOf=${SERVICE_NAME}.service
-
-[Service]
-Type=simple
-User=${APP_USER}
-Group=${APP_USER}
-WorkingDirectory=${APP_DIR}
-Environment=PATH=${APP_DIR}/venv/bin
-ExecStart=${APP_DIR}/venv/bin/python ${APP_DIR}/telegram_bot.py
-EnvironmentFile=${APP_DIR}/.env
-Restart=on-failure
-RestartSec=10
-StandardOutput=append:${LOG_DIR}/bot.log
-StandardError=append:${LOG_DIR}/bot.log
-
-# Security settings
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=${APP_DIR}
-ReadWritePaths=${LOG_DIR}
-ReadWritePaths=${CONFIG_DIR}
-PrivateDevices=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # Create Target Service for managing both
-    cat > "/etc/systemd/system/${SERVICE_NAME}.service" << EOF
-[Unit]
-Description=Parking Monitor - Complete System
-After=network.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/echo "Parking monitor target service started"
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    render_service_files "/etc/systemd/system"
+    chmod 0644 "/etc/systemd/system/${SERVICE_NAME}-"*.service
 
     print_status "Service files created:"
     print_status "  - ${SERVICE_NAME}-monitor.service (web scraper)"
-    print_status "  - ${SERVICE_NAME}-bot.service (telegram bot)"
-    print_status "  - ${SERVICE_NAME}.service (target for management)"
+    print_status "  - ${SERVICE_NAME}-notifier.service (delivery worker)"
+    print_status "  - ${SERVICE_NAME}-bot.service (private Telegram bot)"
+    print_status "  - ${SERVICE_NAME}-discord.service (private Discord bot)"
 
-    # Reload systemd
     systemctl daemon-reload
     print_status "Systemd configuration reloaded"
 }
@@ -300,10 +281,14 @@ create_symlink() {
 enable_service() {
     print_header "Enabling services..."
 
-    # Enable both services (start on boot)
-    systemctl enable "$SERVICE_NAME-monitor"
-    systemctl enable "$SERVICE_NAME-bot"
-    print_status "Both services enabled for automatic startup"
+    # Enable all units without starting them. The separate secret installer
+    # must run before the first start.
+    systemctl enable \
+        "$SERVICE_NAME-monitor" \
+        "$SERVICE_NAME-notifier" \
+        "$SERVICE_NAME-bot" \
+        "$SERVICE_NAME-discord"
+    print_status "All four services enabled for automatic startup"
 
     # Don't start automatically, let user start them manually
     print_status "Services are ready but not started"
@@ -323,15 +308,17 @@ show_summary() {
     echo
     print_status "Architecture:"
     echo "  - Monitor Service: Continuously scrapes parking website"
-    echo "  - Bot Service: Manages Telegram bot and sends alerts"
-    echo "  - State File: Communication between services (state.json)"
+    echo "  - Notifier Service: Delivers queued events independently"
+    echo "  - Telegram Bot Service: Private Telegram commands"
+    echo "  - Discord Bot Service: Private Discord commands"
+    echo "  - SQLite Store: Durable per-channel delivery state"
     echo
     print_status "Available commands:"
-    echo "  sudo parking-monitor start     # Start both services"
-    echo "  sudo parking-monitor stop      # Stop both services"
-    echo "  sudo parking-monitor restart   # Restart both services"
-    echo "  sudo parking-monitor status    # Show both services status"
-    echo "  sudo parking-monitor logs      # Show logs from both services"
+    echo "  sudo parking-monitor start     # Start all four services"
+    echo "  sudo parking-monitor stop      # Stop all four services"
+    echo "  sudo parking-monitor restart   # Restart all four services"
+    echo "  sudo parking-monitor status    # Show all four service statuses"
+    echo "  sudo parking-monitor logs      # Show all four service logs"
     echo "  sudo parking-monitor logs -f   # Follow logs in real-time"
     echo "  sudo parking-monitor update    # Update from git and restart"
     echo "  sudo parking-monitor test      # Test system connections"
@@ -339,20 +326,25 @@ show_summary() {
     echo
     print_status "Service status:"
     echo "  Monitor: $(systemctl is-enabled "$SERVICE_NAME-monitor" --quiet && echo "Enabled" || echo "Disabled") | $(systemctl is-active "$SERVICE_NAME-monitor" --quiet && echo "Running" || echo "Stopped")"
+    echo "  Notifier: $(systemctl is-enabled "$SERVICE_NAME-notifier" --quiet && echo "Enabled" || echo "Disabled") | $(systemctl is-active "$SERVICE_NAME-notifier" --quiet && echo "Running" || echo "Stopped")"
     echo "  Bot: $(systemctl is-enabled "$SERVICE_NAME-bot" --quiet && echo "Enabled" || echo "Disabled") | $(systemctl is-active "$SERVICE_NAME-bot" --quiet && echo "Running" || echo "Stopped")"
+    echo "  Discord: $(systemctl is-enabled "$SERVICE_NAME-discord" --quiet && echo "Enabled" || echo "Disabled") | $(systemctl is-active "$SERVICE_NAME-discord" --quiet && echo "Running" || echo "Stopped")"
     echo
     print_status "Configuration file:"
-    echo "  ${APP_DIR}/.env"
+    echo "  /etc/parking-monitor.env (root:root, mode 0600)"
     echo
     print_status "Important environment variables to set:"
     echo "  TELEGRAM_BOT_TOKEN           - Your Telegram bot token"
-    echo "  TELEGRAM_AUTHORIZED_USER_IDS - Comma-separated user IDs"
-    echo "  TELEGRAM_ADMIN_USER_ID       - Admin user ID for alerts"
-    echo "  MONITORING_INTERVAL          - Monitoring check interval (default: 60)"
-    echo "  LOG_LEVEL                   - Logging level (DEBUG, INFO, WARNING, ERROR)"
+    echo "  TELEGRAM_CHAT_ID             - Private destination chat ID"
+    echo "  TELEGRAM_AUTHORIZED_USER_ID  - Authorized Telegram user ID"
+    echo "  DISCORD_BOT_TOKEN            - Private Discord bot token"
+    echo "  DISCORD_APPLICATION_ID       - Discord application ID"
+    echo "  DISCORD_GUILD_ID             - Private server ID"
+    echo "  DISCORD_CHANNEL_ID           - Private channel ID"
+    echo "  DISCORD_AUTHORIZED_USER_ID   - Authorized Discord user ID"
     echo
     print_status "Next steps:"
-    echo "  1. Configure environment: sudo nano ${APP_DIR}/.env"
+    echo "  1. Install secrets privately: sudo ./scripts/configure-secrets.sh"
     echo "  2. Test the system: sudo parking-monitor test"
     echo "  3. Start the service: sudo parking-monitor start"
     echo "  4. Open Telegram and send /start to your bot"
@@ -386,15 +378,12 @@ validate_environment() {
         print_status "Virtual environment found"
     fi
 
-    # Check if .env file exists
-    if [ ! -f "$APP_DIR/.env" ]; then
-        print_warning ".env file not found at $APP_DIR/.env"
-        print_status "You'll need to create it from the template"
-        if [ -f "$APP_DIR/.env.template" ]; then
-            print_status "Template available at: $APP_DIR/.env.template"
-        fi
+    # This script deliberately does not create, overwrite, or chmod secrets.
+    if [ ! -f "/etc/parking-monitor.env" ]; then
+        print_warning "Secrets are not installed at /etc/parking-monitor.env"
+        print_status "Before starting services, run: sudo ./scripts/configure-secrets.sh"
     else
-        print_status "Environment file found"
+        print_status "Root-managed environment file found"
     fi
 
     print_status "Environment validation completed"
@@ -464,10 +453,11 @@ show_help() {
     echo "This script sets up the parking monitor as a systemd service with:"
     echo "  - Dedicated application user (parking_user)"
     echo "  - Proper file permissions and security"
-    echo "  - Systemd service configuration"
+    echo "  - Four hardened systemd service configurations"
     echo "  - Management script symlink (parking-monitor command)"
     echo
     echo "Usage: sudo $0"
+    echo "       $0 --render-only OUTPUT_DIRECTORY"
     echo
     echo "After running this script, you can manage the service with:"
     echo "  sudo parking-monitor start|stop|restart|status|logs|update|monitor"
@@ -482,6 +472,13 @@ case "${1:-setup}" in
         ;;
     help|--help|-h)
         show_help
+        ;;
+    --render-only)
+        if [ "$#" -ne 2 ]; then
+            print_error "--render-only requires exactly one output directory"
+            exit 2
+        fi
+        render_service_files "$2"
         ;;
     *)
         print_error "Unknown command: $1"

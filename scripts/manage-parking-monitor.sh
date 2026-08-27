@@ -4,6 +4,9 @@
 
 # Configuration
 SERVICE_NAME="parking-service"
+SERVICE_COMPONENTS=(monitor notifier bot discord)
+START_ORDER=(notifier bot discord monitor)
+STOP_ORDER=(monitor discord bot notifier)
 APP_DIR="/opt/parking_monitor"
 APP_USER="parking_user"
 VENV_DIR="/opt/parking_monitor/venv"
@@ -17,6 +20,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Function to print colored output
@@ -67,13 +71,12 @@ check_root_for_command() {
 check_service_exists() {
     local missing_services=()
 
-    if ! systemctl list-unit-files | grep -q "^${SERVICE_NAME}-monitor.service"; then
-        missing_services+=("monitor")
-    fi
-
-    if ! systemctl list-unit-files | grep -q "^${SERVICE_NAME}-bot.service"; then
-        missing_services+=("bot")
-    fi
+    local component
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        if ! systemctl list-unit-files | grep -q "^${SERVICE_NAME}-${component}.service"; then
+            missing_services+=("$component")
+        fi
+    done
 
     if [ ${#missing_services[@]} -ne 0 ]; then
         print_error "Services not found: ${missing_services[*]}"
@@ -90,55 +93,32 @@ start_service() {
     check_root_for_command "start"
     check_service_exists
 
-    local monitor_running=false
-    local bot_running=false
+    local component
+    local started_services=0
+    for component in "${START_ORDER[@]}"; do
+        if systemctl is-active --quiet "${SERVICE_NAME}-${component}"; then
+            print_warning "${component} service is already running"
+            continue
+        fi
 
-    # Check current status
-    if systemctl is-active --quiet "${SERVICE_NAME}-monitor"; then
-        print_warning "Monitor service is already running"
-        monitor_running=true
-    fi
-
-    if systemctl is-active --quiet "${SERVICE_NAME}-bot"; then
-        print_warning "Bot service is already running"
-        bot_running=true
-    fi
-
-    if $monitor_running && $bot_running; then
-        print_status "Both services are already running"
-        status_service
-        return
-    fi
-
-    # Start monitor service first
-    if ! $monitor_running; then
-        print_status "Starting monitor service..."
-        systemctl start "${SERVICE_NAME}-monitor"
+        print_status "Starting ${component} service..."
+        systemctl start "${SERVICE_NAME}-${component}"
         sleep 2
-        if systemctl is-active --quiet "${SERVICE_NAME}-monitor"; then
-            print_status "✅ Monitor service started successfully"
+        if systemctl is-active --quiet "${SERVICE_NAME}-${component}"; then
+            print_status "✅ ${component} service started successfully"
+            started_services=$((started_services + 1))
         else
-            print_error "❌ Failed to start monitor service"
-            systemctl status "${SERVICE_NAME}-monitor" --no-pager -l
+            print_error "❌ Failed to start ${component} service"
+            systemctl status "${SERVICE_NAME}-${component}" --no-pager -l
             exit 1
         fi
-    fi
+    done
 
-    # Start bot service
-    if ! $bot_running; then
-        print_status "Starting bot service..."
-        systemctl start "${SERVICE_NAME}-bot"
-        sleep 2
-        if systemctl is-active --quiet "${SERVICE_NAME}-bot"; then
-            print_status "✅ Bot service started successfully"
-        else
-            print_error "❌ Failed to start bot service"
-            systemctl status "${SERVICE_NAME}-bot" --no-pager -l
-            exit 1
-        fi
+    if [ "$started_services" -eq 0 ]; then
+        print_status "All four services are already running"
+    else
+        print_status "🎉 All four services are running"
     fi
-
-    print_status "🎉 All services started successfully!"
     status_service
 }
 
@@ -150,28 +130,21 @@ stop_service() {
 
     local services_stopped=0
 
-    # Stop monitor service
-    if systemctl is-active --quiet "${SERVICE_NAME}-monitor"; then
-        print_status "Stopping monitor service..."
-        systemctl stop "${SERVICE_NAME}-monitor"
-        services_stopped=$((services_stopped + 1))
-    else
-        print_status "Monitor service was not running"
-    fi
-
-    # Stop bot service
-    if systemctl is-active --quiet "${SERVICE_NAME}-bot"; then
-        print_status "Stopping bot service..."
-        systemctl stop "${SERVICE_NAME}-bot"
-        services_stopped=$((services_stopped + 1))
-    else
-        print_status "Bot service was not running"
-    fi
+    local component
+    for component in "${STOP_ORDER[@]}"; do
+        if systemctl is-active --quiet "${SERVICE_NAME}-${component}"; then
+            print_status "Stopping ${component} service..."
+            systemctl stop "${SERVICE_NAME}-${component}"
+            services_stopped=$((services_stopped + 1))
+        else
+            print_status "${component} service was not running"
+        fi
+    done
 
     if [ $services_stopped -gt 0 ]; then
         print_status "✅ Services stopped successfully"
     else
-        print_status "ℹ️  No services were running"
+        print_status "No services were running"
     fi
 
     status_service
@@ -198,63 +171,35 @@ status_service() {
     print_header "Parking Monitor Services Status"
     check_service_exists
 
-    # Monitor service status
-    echo -e "${CYAN}📊 Monitor Service (Web Scraper):${NC}"
-    if systemctl is-active --quiet "${SERVICE_NAME}-monitor"; then
-        echo -e "  ${GREEN}✅ RUNNING${NC}"
-    else
-        echo -e "  ${RED}❌ STOPPED${NC}"
-    fi
-    if systemctl is-enabled --quiet "${SERVICE_NAME}-monitor"; then
-        echo -e "  ${GREEN}✅ Enabled (starts on boot)${NC}"
-    else
-        echo -e "  ${YELLOW}⚠️  Disabled (won't start on boot)${NC}"
-    fi
+    local component
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        echo
+        echo -e "${CYAN}${component} service:${NC}"
+        if systemctl is-active --quiet "${SERVICE_NAME}-${component}"; then
+            echo -e "  ${GREEN}RUNNING${NC}"
+        else
+            echo -e "  ${RED}STOPPED${NC}"
+        fi
+        if systemctl is-enabled --quiet "${SERVICE_NAME}-${component}"; then
+            echo -e "  ${GREEN}Enabled (starts on boot)${NC}"
+        else
+            echo -e "  ${YELLOW}Disabled (will not start on boot)${NC}"
+        fi
+    done
 
-    # Bot service status
     echo
-    echo -e "${CYAN}🤖 Bot Service (Telegram Interface):${NC}"
-    if systemctl is-active --quiet "${SERVICE_NAME}-bot"; then
-        echo -e "  ${GREEN}✅ RUNNING${NC}"
-    else
-        echo -e "  ${RED}❌ STOPPED${NC}"
-    fi
-    if systemctl is-enabled --quiet "${SERVICE_NAME}-bot"; then
-        echo -e "  ${GREEN}✅ Enabled (starts on boot)${NC}"
-    else
-        echo -e "  ${YELLOW}⚠️  Disabled (won't start on boot)${NC}"
-    fi
+    echo -e "${CYAN}Detailed Service Status:${NC}"
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        echo "--- ${component} service ---"
+        systemctl status "${SERVICE_NAME}-${component}" --no-pager -l | grep -v "Loaded:" || true
+        echo
+    done
 
-    # Detailed status for both services
     echo
-    echo -e "${CYAN}📋 Detailed Service Status:${NC}"
-    echo "--- Monitor Service ---"
-    systemctl status "${SERVICE_NAME}-monitor" --no-pager -l | grep -v "Loaded:"
-    echo
-    echo "--- Bot Service ---"
-    systemctl status "${SERVICE_NAME}-bot" --no-pager -l | grep -v "Loaded:"
-
-    # Resource usage
-    echo
-    echo -e "${CYAN}💻 Resource Usage:${NC}"
-
-    # Monitor service resources
-    if systemctl is-active --quiet "${SERVICE_NAME}-monitor"; then
-        echo "Monitor Service:"
-        systemctl show "${SERVICE_NAME}-monitor" --property=MainPID --value | xargs -I {} ps -p {} -o pid,ppid,cmd,%mem,%cpu --no-headers 2>/dev/null | sed 's/^/  /'
-    fi
-
-    # Bot service resources
-    if systemctl is-active --quiet "${SERVICE_NAME}-bot"; then
-        echo "Bot Service:"
-        systemctl show "${SERVICE_NAME}-bot" --property=MainPID --value | xargs -I {} ps -p {} -o pid,ppid,cmd,%mem,%cpu --no-headers 2>/dev/null | sed 's/^/  /'
-    fi
-
-    # Service uptime
-    echo
-    echo -e "${CYAN}⏱️  Service Uptime:${NC}"
-    echo "Monitor: $(systemctl show "${SERVICE_NAME}-monitor" --property=ActiveEnterTimestamp --value 2>/dev/null || echo "Not started")"
-    echo "Bot: $(systemctl show "${SERVICE_NAME}-bot" --property=ActiveEnterTimestamp --value 2>/dev/null || echo "Not started")"
+    echo -e "${CYAN}Service Uptime:${NC}"
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        echo "${component}: $(systemctl show "${SERVICE_NAME}-${component}" --property=ActiveEnterTimestamp --value 2>/dev/null || echo "Not started")"
+    done
 }
 
 # Show logs
@@ -286,133 +231,81 @@ show_logs() {
 
     print_header "Showing logs (type: $log_type, lines: $LOG_LINES)..."
 
+    local journal_args=()
+    local component
+    for component in "${SERVICE_COMPONENTS[@]}"; do
+        journal_args+=("-u" "${SERVICE_NAME}-${component}")
+    done
+
+    local log_files=(
+        "$LOG_DIR/monitor.log"
+        "$LOG_DIR/notifier.log"
+        "$LOG_DIR/telegram.log"
+        "$LOG_DIR/discord.log"
+    )
+
     case $log_type in
         service|systemd)
             if $follow_logs; then
-                print_status "Following both service logs (Ctrl+C to stop)..."
-                journalctl -u "${SERVICE_NAME}-monitor" -u "${SERVICE_NAME}-bot" -f
+                print_status "Following all four service logs (Ctrl+C to stop)..."
+                journalctl "${journal_args[@]}" -f
             else
-                print_status "Showing monitor service logs:"
-                journalctl -u "${SERVICE_NAME}-monitor" -n "${LOG_LINES}" --no-pager
-                echo
-                print_status "Showing bot service logs:"
-                journalctl -u "${SERVICE_NAME}-bot" -n "${LOG_LINES}" --no-pager
+                journalctl "${journal_args[@]}" -n "${LOG_LINES}" --no-pager
             fi
             ;;
-        python|app)
-            # Show application logs - prefer log files over journalctl for actual Python output
-            if [ -f "$LOG_DIR/monitor.log" ] && [ -f "$LOG_DIR/bot.log" ]; then
+        python|app|file)
+            local existing_logs=()
+            local log_file
+            for log_file in "${log_files[@]}"; do
+                if [ -f "$log_file" ]; then
+                    existing_logs+=("$log_file")
+                fi
+            done
+            if [ "${#existing_logs[@]}" -eq 0 ]; then
+                print_warning "Application log files not found; using journalctl"
                 if $follow_logs; then
-                    print_status "Following both application logs from files (Ctrl+C to stop)..."
-                    # Use multitail if available, otherwise show both
-                    if command -v multitail &> /dev/null; then
-                        multitail -s 2 "$LOG_DIR/monitor.log" "$LOG_DIR/bot.log"
-                    else
-                        print_status "Monitor logs:"
-                        tail -f "$LOG_DIR/monitor.log" &
-                        MONITOR_PID=$!
-                        print_status "Bot logs:"
-                        tail -f "$LOG_DIR/bot.log" &
-                        BOT_PID=$!
-                        trap "kill $MONITOR_PID $BOT_PID 2>/dev/null" EXIT
-                        wait
-                    fi
+                    journalctl "${journal_args[@]}" -f
                 else
-                    print_status "Showing monitor logs from file..."
-                    tail -n "${LOG_LINES}" "$LOG_DIR/monitor.log"
+                    journalctl "${journal_args[@]}" -n "${LOG_LINES}" --no-pager
+                fi
+            elif $follow_logs; then
+                print_status "Following available application logs (Ctrl+C to stop)..."
+                tail -f "${existing_logs[@]}"
+            else
+                for log_file in "${existing_logs[@]}"; do
+                    print_status "$(basename "$log_file"):"
+                    tail -n "${LOG_LINES}" "$log_file"
                     echo
-                    print_status "Showing bot logs from file..."
-                    tail -n "${LOG_LINES}" "$LOG_DIR/bot.log"
-                fi
-            else
-                # Fallback to journalctl for missing log files
-                print_warning "Some log files not found, using journalctl..."
-                if $follow_logs; then
-                    journalctl -u "${SERVICE_NAME}-monitor" -u "${SERVICE_NAME}-bot" -f | grep -vE "^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]+ [0-9:]+ .* systemd\[1\]:"
-                else
-                    journalctl -u "${SERVICE_NAME}-monitor" -u "${SERVICE_NAME}-bot" -n "${LOG_LINES}" --no-pager | grep -vE "^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]+ [0-9:]+ .* systemd\[1\]:"
-                fi
+                done
             fi
             ;;
-        monitor)
-            # Show monitor service logs only
+        monitor|notifier|bot|telegram|discord)
+            if [ "$log_type" = "telegram" ]; then
+                component=bot
+            else
+                component="$log_type"
+            fi
             if $follow_logs; then
-                print_status "Following monitor service logs (Ctrl+C to stop)..."
-                if [ -f "$LOG_DIR/monitor.log" ]; then
-                    tail -f "$LOG_DIR/monitor.log"
-                else
-                    journalctl -u "${SERVICE_NAME}-monitor" -f
-                fi
+                journalctl -u "${SERVICE_NAME}-${component}" -f
             else
-                print_status "Showing monitor service logs..."
-                if [ -f "$LOG_DIR/monitor.log" ]; then
-                    tail -n "${LOG_LINES}" "$LOG_DIR/monitor.log"
-                else
-                    journalctl -u "${SERVICE_NAME}-monitor" -n "${LOG_LINES}" --no-pager
-                fi
-            fi
-            ;;
-        bot)
-            # Show bot service logs only
-            if $follow_logs; then
-                print_status "Following bot service logs (Ctrl+C to stop)..."
-                if [ -f "$LOG_DIR/bot.log" ]; then
-                    tail -f "$LOG_DIR/bot.log"
-                else
-                    journalctl -u "${SERVICE_NAME}-bot" -f
-                fi
-            else
-                print_status "Showing bot service logs..."
-                if [ -f "$LOG_DIR/bot.log" ]; then
-                    tail -n "${LOG_LINES}" "$LOG_DIR/bot.log"
-                else
-                    journalctl -u "${SERVICE_NAME}-bot" -n "${LOG_LINES}" --no-pager
-                fi
-            fi
-            ;;
-        file)
-            # Show both log files
-            if [ -f "$LOG_DIR/monitor.log" ] && [ -f "$LOG_DIR/bot.log" ]; then
-                if $follow_logs; then
-                    print_status "Following log files (Ctrl+C to stop)..."
-                    if command -v multitail &> /dev/null; then
-                        multitail -s 2 "$LOG_DIR/monitor.log" "$LOG_DIR/bot.log"
-                    else
-                        tail -f "$LOG_DIR/monitor.log" &
-                        MONITOR_PID=$!
-                        tail -f "$LOG_DIR/bot.log" &
-                        BOT_PID=$!
-                        trap "kill $MONITOR_PID $BOT_PID 2>/dev/null" EXIT
-                        wait
-                    fi
-                else
-                    print_status "Monitor log file:"
-                    tail -n "${LOG_LINES}" "$LOG_DIR/monitor.log"
-                    echo
-                    print_status "Bot log file:"
-                    tail -n "${LOG_LINES}" "$LOG_DIR/bot.log"
-                fi
-            else
-                print_warning "Log files not found"
-                print_status "Falling back to journalctl..."
-                journalctl -u "${SERVICE_NAME}-monitor" -u "${SERVICE_NAME}-bot" -n "${LOG_LINES}" --no-pager
+                journalctl -u "${SERVICE_NAME}-${component}" -n "${LOG_LINES}" --no-pager
             fi
             ;;
         error|errors)
-            print_status "Showing error logs from both services..."
-            journalctl -u "${SERVICE_NAME}-monitor" -u "${SERVICE_NAME}-bot" -n "${LOG_LINES}" --no-pager -p err
+            print_status "Showing error logs from all four services..."
+            journalctl "${journal_args[@]}" -n "${LOG_LINES}" --no-pager -p err
             ;;
         all)
-            print_status "Showing all logs from both services..."
+            print_status "Showing all logs from all four services..."
             if $follow_logs; then
-                journalctl -u "${SERVICE_NAME}-monitor" -u "${SERVICE_NAME}-bot" -f
+                journalctl "${journal_args[@]}" -f
             else
-                journalctl -u "${SERVICE_NAME}-monitor" -u "${SERVICE_NAME}-bot" -n "${LOG_LINES}" --no-pager
+                journalctl "${journal_args[@]}" -n "${LOG_LINES}" --no-pager
             fi
             ;;
         *)
             print_error "Unknown log type: $log_type"
-            print_status "Available types: service, python, monitor, bot, file, error, all"
+            print_status "Available types: service, python, monitor, notifier, bot, discord, file, error, all"
             exit 1
             ;;
     esac

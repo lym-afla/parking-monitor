@@ -1,510 +1,323 @@
-# Parking Monitor - Ubuntu Server Deployment Guide
+# Secure dual-channel deployment
 
-This guide explains how to deploy and run the Parking Monitor as a service on an Ubuntu virtual server.
+This runbook deploys the monitor, notifier, private Telegram bot, and private
+Discord bot without exposing credentials. Commands assume the checkout is
+`/opt/parking_monitor` and its virtual environment is `venv`.
 
-## Table of Contents
+## Security boundaries
 
-1. [Prerequisites](#prerequisites)
-2. [Server Setup](#server-setup)
-3. [Application Deployment](#application-deployment)
-4. [Service Installation](#service-installation)
-5. [Configuration](#configuration)
-6. [Service Management](#service-management)
-7. [Monitoring](#monitoring)
-8. [Troubleshooting](#troubleshooting)
-9. [Maintenance](#maintenance)
+Keep both of these values secret:
 
-## Prerequisites
+- `TELEGRAM_BOT_TOKEN`
+- `DISCORD_BOT_TOKEN`
 
-### Server Requirements
+Never pass a token as a command-line argument, paste it into chat, place it in
+Git, or print `/etc/parking-monitor.env`. The Discord integration uses a bot
+token, not a webhook URL.
 
-- **OS**: Ubuntu 20.04 LTS or later
-- **RAM**: Minimum 1GB, recommended 2GB
-- **Storage**: Minimum 10GB free space
-- **Network**: Stable internet connection
-- **Permissions**: sudo/root access
+These Discord identifiers are configuration, not credentials:
 
-### Required Software
+| Variable | Reviewed value |
+|---|---:|
+| `DISCORD_APPLICATION_ID` | `1542514080810664018` |
+| `DISCORD_GUILD_ID` | `1476852384826392628` |
+| `DISCORD_CHANNEL_ID` | `1542511880659017792` |
+| `DISCORD_AUTHORIZED_USER_ID` | `1138419941926776893` |
 
-The setup script will automatically install these dependencies:
-- Python 3.8+
-- pip
-- Node.js (for Playwright)
-- Git
-- systemd (for service management)
+The secret installer writes all eight required variable names to
+`/etc/parking-monitor.env`, owned by `root:root` with mode `0600`. Systemd's
+manager reads that file and passes the environment to processes running as
+`parking_user`; the account itself must not be able to read the file.
 
-## Server Setup
+The units use `ProtectSystem=strict` and expose `/opt/parking_monitor` as their
+single writable application boundary. This is required for current behavior:
+all processes initialize/read SQLite health, and both command bots atomically
+replace `state.json` for `/interval`. Moving `state.json`, SQLite, and logs to
+`/var/lib/parking-monitor` and `/var/log/parking-monitor` is a future hardening
+step that would permit narrower per-service write paths.
 
-### 1. Update System
+## Platform preparation
 
-```bash
-sudo apt update && sudo apt upgrade -y
-```
+### Telegram BotFather
 
-### 2. Create Application Directory
+In a private conversation with [BotFather](https://t.me/BotFather):
 
-```bash
-sudo mkdir -p /opt/parking_monitor
-sudo mkdir -p /opt/parking_monitor/logs
-sudo mkdir -p /opt/parking_monitor/config
-```
+1. Use `/setjoingroups`, select the bot, and choose **Disable** so it cannot be
+   added to groups.
+2. Use `/setprivacy`, select the bot, and choose **Enable**. This is defense in
+   depth if group membership is ever enabled later.
+3. Restore the desired public name, description, and avatar if required.
 
-### 3. Install Basic Dependencies
+The application allowlist remains authoritative even with these controls.
 
-```bash
-sudo apt install -y python3 python3-pip python3-venv git curl wget
-```
+### Private Discord bot installation
 
-## Application Deployment
+In the Discord Developer Portal for the reviewed application:
 
-### Option A: Deploy from Git Repository
+1. On **Bot**, disable **Public Bot**. Do not enable Message Content, Server
+   Members, or Presence privileged intents.
+2. Under **Installation**, allow **Guild Install** only. Do not enable user
+   installation.
+3. For the guild install, request the `bot` and `applications.commands` scopes.
+   Grant only View Channels, Send Messages, Embed Links, and Read Message
+   History in the private parking channel.
+4. Use the generated install link while signed in as the private server owner,
+   choose the reviewed server, and confirm the bot can see only the intended
+   channel.
 
-1. **Clone the repository:**
+Slash commands are registered only to the reviewed guild. Runtime checks also
+require the reviewed guild, channel, and user IDs; Discord role permissions are
+not the sole authorization boundary.
 
-```bash
-cd /opt
-sudo git clone <your-github-repo-url> parking_monitor
-```
+## Pre-deployment record
 
-2. **Set ownership:**
-
-```bash
-sudo chown -R $USER:$USER /opt/parking_monitor
-```
-
-### Option B: Deploy from Local Files
-
-1. **Upload files to server:**
+Do this before changing the checkout. Keep the output in the deployment record:
 
 ```bash
-# Using scp
-scp -r /path/to/parking_monitor user@server:/tmp/
+ssh cloudru-server
+cd /opt/parking_monitor
 
-# Or using rsync
-rsync -avz /path/to/parking_monitor/ user@server:/opt/parking_monitor/
+PREVIOUS_REVISION=$(git rev-parse HEAD)
+printf 'previous revision: %s\n' "$PREVIOUS_REVISION"
+UNIT_BACKUP="/var/backups/parking-monitor-units-$(date -u +%Y%m%dT%H%M%SZ)"
+sudo install -d -m 700 "$UNIT_BACKUP"
+sudo cp -a /etc/systemd/system/parking-service-*.service "$UNIT_BACKUP"/
+printf 'unit backup: %s\n' "$UNIT_BACKUP"
+sudo systemctl show \
+  parking-service-monitor parking-service-notifier \
+  parking-service-bot parking-service-discord \
+  --property=Id --property=ActiveState --property=ActiveEnterTimestamp
 ```
 
-2. **Set ownership:**
+Also preserve monitoring counters for comparison without changing them:
 
 ```bash
-sudo chown -R $USER:$USER /opt/parking_monitor
+venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+state = json.loads(Path("state.json").read_text(encoding="utf-8"))
+for name in ("checks", "hits", "last_enabled", "last_check"):
+    print(f"{name}={state.get(name)!r}")
+PY
 ```
 
-## Service Installation
+## Deploy code without restarting
 
-### 1. Make Scripts Executable
+Pull only a fast-forward update, install dependencies, and verify the checked
+out code before installing units:
 
 ```bash
 cd /opt/parking_monitor
-chmod +x scripts/*.sh
-```
-
-### 2. Run the Setup Script
-
-```bash
+git pull --ff-only
+venv/bin/pip install -r requirements.txt
+venv/bin/python -m playwright install chromium
+venv/bin/python -m unittest discover -v
+venv/bin/python -m py_compile \
+  config.py command_service.py notification_store.py notifier.py \
+  telegram_bot.py discord_bot.py monitor.py
 sudo ./scripts/setup-service.sh
 ```
 
-The setup script will:
-- Create a dedicated system user (`parking_user`)
-- Install Python dependencies
-- Install Playwright and browsers
-- Create systemd service file
-- Set up management script symlink
-- Configure proper permissions
+`setup-service.sh` installs and enables four unit files and reloads systemd. It
+does not start services and does not create or overwrite
+`/etc/parking-monitor.env`. Do not restart any service until local remote tests
+pass and the secret installation below validates.
 
-### 3. Verify Installation
+## Install credentials privately
+
+The user who owns the credentials must open their own SSH terminal and run
+exactly:
 
 ```bash
-sudo parking-monitor test
+ssh cloudru-server
+cd /opt/parking_monitor
+sudo ./scripts/configure-secrets.sh
 ```
 
-## Configuration
+Enter the replacement Telegram bot token and Discord bot token at the
+non-echoing prompts. Do not send them to another operator.
 
-### 1. Create Environment File
+Verify metadata and variable names only. These commands deliberately do not
+print values:
 
 ```bash
-# Copy template if exists
-cp .env.template .env
-
-# Or create from scratch
-nano .env
+sudo stat -c '%U:%G %a %n' /etc/parking-monitor.env
+sudo awk -F= 'NF {print $1}' /etc/parking-monitor.env
+sudo -u parking_user test ! -r /etc/parking-monitor.env
 ```
 
-### 2. Configure Required Variables
+Required metadata is `root:root 600`. Required names are:
 
-```bash
-# Telegram Bot Configuration
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_AUTHORIZED_USER_IDS=user_id1,user_id2
-TELEGRAM_ADMIN_USER_ID=admin_user_id
-
-# Monitoring Configuration
-MONITORING_INTERVAL=60          # Check every 60 seconds
-LOG_LEVEL=INFO                  # DEBUG, INFO, WARNING, ERROR
-
-# Optional Configuration
-TIMEZONE=Europe/Moscow
-MAX_RETRIES=3
-RETRY_DELAY=10
+```text
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
+TELEGRAM_AUTHORIZED_USER_ID
+DISCORD_BOT_TOKEN
+DISCORD_APPLICATION_ID
+DISCORD_GUILD_ID
+DISCORD_CHANNEL_ID
+DISCORD_AUTHORIZED_USER_ID
 ```
 
-### 3. Get Telegram Bot Token
+If any check fails, do not start the services. Re-run the interactive installer;
+do not repair the file by pasting tokens into an editor command.
 
-1. Talk to [@BotFather](https://t.me/botfather) on Telegram
-2. Create a new bot: `/newbot`
-3. Copy the bot token
+## Start and verify
 
-### 4. Get Your Telegram User ID
-
-1. Talk to [@userinfobot](https://t.me/userinfobot) on Telegram
-2. Copy your numeric user ID
-
-## Service Management
-
-### Using the Management Script
-
-All commands use the `parking-monitor` symlink created during setup:
+Restart the notifier and command bots first, then the monitor:
 
 ```bash
-# Start the service
-sudo parking-monitor start
+sudo systemctl restart parking-service-notifier
+sudo systemctl restart parking-service-bot
+sudo systemctl restart parking-service-discord
+sudo systemctl restart parking-service-monitor
 
-# Stop the service
-sudo parking-monitor stop
-
-# Restart the service
-sudo parking-monitor restart
-
-# Check status
 sudo parking-monitor status
-
-# View logs
-sudo parking-monitor logs
-
-# Follow logs in real-time
-sudo parking-monitor logs -f
-
-# View Python application logs
-sudo parking-monitor logs -t python
-
-# View error logs only
-sudo parking-monitor logs -t error
+sudo parking-monitor logs -t error -n 100
 ```
 
-### Using systemctl Directly
+All four units must be `active`. Compare `checks`, `hits`, `last_enabled`, and
+`last_check` with the pre-deployment record; a deployment must not reset them.
+The Telegram startup must report polling with pending updates dropped, which
+removes a stale webhook. Discord must register exactly the guild commands
+`status`, `stats`, and `interval`, with no authentication or configuration
+errors in either bot log.
+
+The authorized user then runs:
+
+- Telegram: `/status`
+- Discord in the configured channel: `/status`, `/stats`, and `/interval`
+
+Each `/status` response reports Telegram and Discord delivery health
+independently.
+
+## Health and delivery audit
+
+Service health:
 
 ```bash
-# Enable service to start on boot
-sudo systemctl enable parking-service
-
-# Start service
-sudo systemctl start parking-service
-
-# Check status
-sudo systemctl status parking-service
-
-# View logs
-sudo journalctl -u parking-service -f
-```
-
-## Monitoring
-
-### Health Checks
-
-```bash
-# Quick health check
-sudo parking-monitor monitor
-
-# Continuous monitoring (refreshes every 10s)
-sudo parking-monitor monitor continuous
-
-# Resource usage
-sudo parking-monitor monitor resources
-
-# Log analysis
-sudo parking-monitor monitor logs 200
-
-# Check parking status
-sudo parking-monitor monitor parking
-```
-
-### Log Files
-
-- **Service logs**: `/opt/parking_monitor/logs/parking.log`
-- **Systemd logs**: `journalctl -u parking-service`
-- **State file**: `/opt/parking_monitor/state.json`
-
-### Important Log Locations
-
-```bash
-# Application logs
-tail -f /opt/parking_monitor/logs/parking.log
-
-# System service logs
-sudo journalctl -u parking-service -f
-
-# Error logs only
-sudo journalctl -u parking-service -p err -f
-```
-
-## Troubleshooting
-
-### Common Issues
-
-#### 1. Service Won't Start
-
-```bash
-# Check service status
 sudo parking-monitor status
-
-# Check logs for errors
-sudo parking-monitor logs -t error
-
-# Test configuration
-sudo parking-monitor test
+sudo parking-monitor logs -t notifier -n 100
+sudo parking-monitor logs -t bot -n 100
+sudo parking-monitor logs -t discord -n 100
 ```
 
-#### 2. Playwright Issues
+Read delivery metadata without selecting payloads or stored error text:
 
 ```bash
-# Reinstall Playwright
+venv/bin/python - <<'PY'
+import sqlite3
+
+connection = sqlite3.connect("notifications.sqlite3")
+for row in connection.execute(
+    """
+    SELECT event_id, channel, status, attempt_count,
+           last_attempt_at, delivered_at
+    FROM notification_deliveries
+    ORDER BY event_id DESC, channel
+    LIMIT 20
+    """
+):
+    print(row)
+PY
+```
+
+Expected healthy delivery rows are `delivered`, one per event and channel.
+`retry` on one channel does not invalidate a `delivered` row on the other.
+
+## Clearly labeled test event
+
+Record the four monitoring fields before the test, then create one administrative
+event. The command below writes `test_notification` with `test=true`; both bots
+render it as **TEST NOTIFICATION**. It does not write `state.json`.
+
+```bash
 cd /opt/parking_monitor
-source venv/bin/activate
-python -m playwright install chromium
-python -m playwright install-deps chromium
+sudo -u parking_user venv/bin/python - <<'PY'
+from datetime import datetime, timezone
+from pathlib import Path
+
+from notification_store import NotificationStore
+
+store = NotificationStore(Path("notifications.sqlite3"))
+event_id = store.create_event(
+    "test_notification",
+    {"test": True, "label": "operator delivery verification"},
+    source_check=0,
+    channels=("telegram", "discord"),
+    event_key=f"operator-test:{datetime.now(timezone.utc).isoformat()}",
+)
+print(f"created test event_id={event_id}")
+PY
 ```
 
-#### 3. Permission Issues
+Wait for the notifier, then confirm that the displayed event ID has exactly one
+`delivered` row for Telegram and one for Discord. Confirm the labeled message is
+visible in both applications. Re-read `checks`, `hits`, `last_enabled`, and
+`last_check`; all four must match the pre-test values.
+
+Do not simulate parking availability by editing `state.json`, toggling
+`last_enabled`, or changing monitoring counters.
+
+## Credential-leak audit
+
+Before sign-off, a root-only operator must scan the four service journals and
+`notification_deliveries.last_error` for the full current token values and
+stable token fragments. The scanner must print only a match count and location
+category, never the fragment or matching line. A non-zero count blocks
+deployment. Also confirm no authorization headers, token-bearing request URLs,
+or environment values appear in the captured logs.
+
+Record the final revision and service timestamps:
 
 ```bash
-# Fix ownership
-sudo chown -R parking_user:parking_user /opt/parking_monitor
-
-# Fix permissions
-sudo chmod +x /opt/parking_monitor/scripts/*.sh
-sudo chmod +x /opt/parking_monitor/*.py
+git rev-parse HEAD
+sudo systemctl show \
+  parking-service-monitor parking-service-notifier \
+  parking-service-bot parking-service-discord \
+  --property=Id --property=ActiveState --property=ActiveEnterTimestamp
 ```
 
-#### 4. Network Issues
+## Recovery
+
+For a single failed service, inspect its dedicated log and restart only that
+unit:
 
 ```bash
-# Test connectivity to parking website
-ping parking.mos.ru
-
-# Test with curl
-curl -I https://parking.mos.ru
-
-# Check firewall rules
-sudo ufw status
+sudo parking-monitor logs -t notifier -n 100
+sudo systemctl restart parking-service-notifier
+sudo parking-monitor status
 ```
 
-#### 5. Telegram Bot Issues
+Authentication failures require rerunning the private secret installer. Never
+put a replacement token on the command line.
+
+## Rollback
+
+Rollback is required if the monitor or notifier cannot start or monitoring
+statistics change unexpectedly. Preserve runtime data before changing Git:
 
 ```bash
-# Test bot token
-curl https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getMe
-
-# Check bot is running and responsive
-curl https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates
-```
-
-### Error Codes
-
-- **Exit Code 1**: General error (check logs)
-- **Exit Code 2**: Configuration error (missing .env or invalid tokens)
-- **Exit Code 3**: Network error (cannot reach parking website)
-- **Exit Code 4**: Authentication error (invalid Telegram token)
-
-## Maintenance
-
-### Updating the Application
-
-```bash
-# Update from git repository
-sudo parking-monitor update
-
-# Or manually:
 cd /opt/parking_monitor
-sudo -u parking_user git pull
-source venv/bin/activate
-pip install -r requirements.txt --upgrade
-sudo systemctl restart parking-service
+ROLLBACK_BACKUP="/var/backups/parking-monitor-$(date -u +%Y%m%dT%H%M%SZ)"
+sudo install -d -m 700 "$ROLLBACK_BACKUP"
+sudo cp -a state.json notifications.sqlite3 "$ROLLBACK_BACKUP"/
+for file in notifications.sqlite3-wal notifications.sqlite3-shm; do
+  if [ -e "$file" ]; then sudo cp -a "$file" "$ROLLBACK_BACKUP"/; fi
+done
+sudo systemctl stop parking-service-notifier parking-service-discord
+git switch --detach "$PREVIOUS_REVISION"
+sudo cp -a "$UNIT_BACKUP"/parking-service-*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart parking-service-bot parking-service-monitor
+sudo systemctl status parking-service-bot parking-service-monitor --no-pager
 ```
 
-### Log Rotation
+If the recorded revision contains different unit definitions, reinstall those
+reviewed unit files before `daemon-reload`; do not blindly start the new notifier
+or Discord units. Report the exact gate that failed and the recorded revisions
+and timestamps.
 
-Create log rotation configuration:
-
-```bash
-sudo nano /etc/logrotate.d/parking-monitor
-```
-
-Content:
-```
-/opt/parking_monitor/logs/*.log {
-    daily
-    missingok
-    rotate 7
-    compress
-    delaycompress
-    notifempty
-    create 644 parking_user parking_user
-    postrotate
-        systemctl reload parking-service || true
-    endscript
-}
-```
-
-### Backup Configuration
-
-Backup important files:
-
-```bash
-# Create backup directory
-sudo mkdir -p /opt/backups/parking_monitor
-
-# Backup configuration and state
-sudo cp /opt/parking_monitor/.env /opt/backups/parking_monitor/
-sudo cp /opt/parking_monitor/state.json /opt/backups/parking_monitor/ 2>/dev/null || true
-
-# Create backup script
-cat > /opt/parking_monitor/scripts/backup.sh << 'EOF'
-#!/bin/bash
-BACKUP_DIR="/opt/backups/parking_monitor/$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$BACKUP_DIR"
-cp /opt/parking_monitor/.env "$BACKUP_DIR/"
-cp /opt/parking_monitor/state.json "$BACKUP_DIR/" 2>/dev/null || true
-tar -czf "$BACKUP_DIR.tar.gz" -C "$BACKUP_DIR" .
-rm -rf "$BACKUP_DIR"
-EOF
-chmod +x /opt/parking_monitor/scripts/backup.sh
-```
-
-### Scheduled Tasks
-
-Add cron job for daily backup:
-
-```bash
-sudo crontab -e
-```
-
-Add line:
-```
-0 2 * * * /opt/parking_monitor/scripts/backup.sh
-```
-
-### Performance Optimization
-
-1. **Monitor Resource Usage**:
-```bash
-sudo parking-monitor monitor resources
-```
-
-2. **Adjust Monitoring Interval**:
-Edit `.env` file:
-```bash
-MONITORING_INTERVAL=120  # Increase to check every 2 minutes
-```
-
-3. **Log Level Adjustment**:
-For production, use INFO or WARNING level:
-```bash
-LOG_LEVEL=WARNING
-```
-
-## Security Considerations
-
-### 1. Secure Configuration File
-
-```bash
-# Restrict .env file permissions
-sudo chmod 600 /opt/parking_monitor/.env
-sudo chown parking_user:parking_user /opt/parking_monitor/.env
-```
-
-### 2. Firewall Configuration
-
-```bash
-# Allow only necessary ports
-sudo ufw allow ssh
-sudo ufw enable
-```
-
-### 3. System User Security
-
-The setup creates a system user with limited permissions:
-- No shell access by default
-- Limited file system access
-- Cannot gain additional privileges
-
-### 4. Update Regularly
-
-```bash
-# Update system packages
-sudo apt update && sudo apt upgrade -y
-
-# Update Python dependencies
-sudo parking-monitor update
-```
-
-## Production Deployment Checklist
-
-- [ ] Server resources meet requirements
-- [ ] System packages updated
-- [ ] Application deployed to `/opt/parking_monitor`
-- [ ] Setup script executed successfully
-- [ ] Environment file configured with proper values
-- [ ] Telegram bot token valid and authorized
-- [ ] Service starts and runs without errors
-- [ ] Monitoring script shows healthy status
-- [ ] Log rotation configured
-- [ ] Backup procedures in place
-- [ ] Firewall configured
-- [ ] Service enabled for automatic start
-- [ ] Documentation available for team
-
-## Support
-
-For issues and questions:
-
-1. Check the troubleshooting section above
-2. Review application logs: `sudo parking-monitor logs`
-3. Run health check: `sudo parking-monitor monitor`
-4. Test configuration: `sudo parking-monitor test`
-
-## Recovery Procedures
-
-### Full Service Recovery
-
-```bash
-# 1. Stop service if running
-sudo parking-monitor stop
-
-# 2. Backup current state
-sudo cp /opt/parking_monitor/state.json /tmp/state_backup.json 2>/dev/null || true
-
-# 3. Reinstall dependencies
-cd /opt/parking_monitor
-source venv/bin/activate
-pip install -r requirements.txt --force-reinstall
-
-# 4. Reinstall Playwright
-python -m playwright install chromium --force
-
-# 5. Restart service
-sudo parking-monitor start
-
-# 6. Verify
-sudo parking-monitor test
-```
-
-### Configuration Reset
-
-```bash
-# Reset to template
-cd /opt/parking_monitor
-sudo cp .env.template .env
-sudo nano .env  # Reconfigure
-sudo parking-monitor restart
-```
+Never delete or overwrite `notifications.sqlite3`, its WAL files, `state.json`,
+the rollback backup, or `/etc/parking-monitor.env` during rollback.
