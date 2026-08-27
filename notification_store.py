@@ -1,8 +1,10 @@
 """Durable SQLite-backed notification event and delivery state."""
 
 import json
+import os
 import re
 import sqlite3
+import stat
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -57,7 +59,25 @@ class NotificationStore:
         self._db_path = Path(db_path)
         self._secrets = tuple(secret for secret in secrets if secret)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._prepare_database_file()
         self._initialize_schema()
+
+    def _prepare_database_file(self) -> None:
+        """Pin a regular database inode and make it writable by the runtime group."""
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self._db_path, flags, 0o660)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise OSError("refusing non-regular or multiply-linked database")
+            if stat.S_IMODE(metadata.st_mode) != 0o660:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(descriptor, 0o660)
+                else:
+                    os.chmod(self._db_path, 0o660)
+        finally:
+            os.close(descriptor)
 
     def sanitize(self, error: object) -> str:
         """Sanitize an error with this store's runtime redaction values."""

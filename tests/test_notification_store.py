@@ -1,6 +1,8 @@
 import json
+import os
 import secrets
 import sqlite3
+import stat
 import tempfile
 import threading
 import unittest
@@ -24,6 +26,15 @@ class NotificationStoreTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary_directory.cleanup()
+
+    @unittest.skipIf(os.name == "nt", "POSIX file modes are required")
+    def test_database_is_created_with_shared_runtime_mode(self):
+        shared_path = Path(self.temporary_directory.name) / "shared.sqlite3"
+        shared_path.touch(mode=0o640)
+        os.chmod(shared_path, 0o640)
+        NotificationStore(shared_path)
+
+        self.assertEqual(stat.S_IMODE(shared_path.stat().st_mode), 0o660)
 
     def create_dual_channel_event(self, event_key=None):
         return self.store.create_event(
