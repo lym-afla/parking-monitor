@@ -32,6 +32,7 @@ ENV/
 .env
 .env.local
 .env.*.local
+parking-monitor.env
 
 # IDE
 .vscode/

@@ -234,8 +234,8 @@ TARGET_ADDRESS_TEXT = "улица Поклонная, дом 11А"
 # State file location
 STATE_FILE = "state.json"
 
-# Telegram bot credentials
-TELEGRAM_BOT_TOKEN = "8134011188:AAHU1fHpN8RpJewho3bOr2bbdmCnOU7djZI"
+# Telegram bot credentials are loaded from the environment at runtime.
+TELEGRAM_BOT_TOKEN = "<set-in-/etc/parking-monitor.env>"
 TELEGRAM_CHAT_ID = "404346140"
 ```
 

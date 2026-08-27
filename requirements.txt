@@ -1,2 +1,4 @@
 playwright
 python-telegram-bot
+discord.py>=2.4,<3
+httpx>=0.27,<1
