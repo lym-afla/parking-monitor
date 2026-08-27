@@ -168,10 +168,12 @@ Every command above is fail-closed. Do not install or remove any unit unless
 both mandatory units, the five-line presence manifest, and the five-line
 enablement record pass the non-empty/readable checks.
 
-A first-time full setup adopts `.git` and an existing `venv` for
-`parking_user` without changing virtual-environment modes. After that boundary
-is established, all Git and Python dependency operations run as
-`parking_user`; an existing host must not rerun full setup during upgrade.
+A first-time full setup recursively adopts the entire checkout for
+`parking_user`, including nested source/docs directories, `.git`, and an
+existing `venv`, without recursively chmodding the tree or changing
+virtual-environment modes. After that boundary is established, all Git and
+Python dependency operations run as `parking_user`; an existing host must not
+rerun full setup during upgrade.
 
 ## Deploy code without restarting
 

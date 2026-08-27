@@ -118,20 +118,13 @@ setup_permissions() {
     mkdir -p "$LOG_DIR"
     mkdir -p "$CONFIG_DIR"
 
-    # Own only runtime boundaries and their existing runtime files. Adopt the
-    # Git metadata and an existing virtual environment so all future Git/pip
-    # operations can run as the service account. Chown preserves executable
-    # modes; never chmod virtual-environment internals.
-    chown "$APP_USER:$APP_USER" "$APP_DIR" "$LOG_DIR" "$CONFIG_DIR"
+    # Adopt the complete checkout so future Git and pip operations can run as
+    # the service account, including updates below nested scripts/tests/docs
+    # directories. Chown preserves executable modes; never recursively chmod
+    # the checkout or chmod virtual-environment internals.
+    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
     chmod 0755 "$APP_DIR" "$LOG_DIR"
     chmod 0700 "$CONFIG_DIR"
-
-    if [ -e "$APP_DIR/.git" ]; then
-        chown -R "$APP_USER:$APP_USER" "$APP_DIR/.git"
-    fi
-    if [ -d "$VENV_DIR" ]; then
-        chown -R "$APP_USER:$APP_USER" "$VENV_DIR"
-    fi
 
     local runtime_path
     for runtime_path in \
@@ -143,13 +136,6 @@ setup_permissions() {
         if [ -e "$runtime_path" ]; then
             chown "$APP_USER:$APP_USER" "$runtime_path"
             chmod 0600 "$runtime_path"
-        fi
-    done
-
-    local script_path
-    for script_path in "$APP_DIR"/scripts/*.sh; do
-        if [ -f "$script_path" ]; then
-            chmod 0755 "$script_path"
         fi
     done
 
@@ -286,9 +272,10 @@ create_symlink() {
         print_error "Management script not found: $script_path"
         return 1
     fi
-
-    # Make sure script is executable
-    chmod +x "$script_path"
+    if [ ! -x "$script_path" ]; then
+        print_error "Management script is not executable: $script_path"
+        return 1
+    fi
 
     # Remove existing symlink if it exists
     if [ -L "$SYMLINK_PATH" ]; then
@@ -299,9 +286,6 @@ create_symlink() {
     # Create new symlink
     ln -s "$script_path" "$SYMLINK_PATH"
     print_status "Symlink created: $SYMLINK_PATH -> $script_path"
-
-    # Ensure symlink is executable
-    chmod +x "$SYMLINK_PATH"
 
     # Test symlink
     if [ -x "$SYMLINK_PATH" ]; then

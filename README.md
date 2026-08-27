@@ -84,8 +84,9 @@ sudo ./scripts/configure-secrets.sh
 sudo parking-monitor start
 ```
 
-Full setup adopts the checkout's `.git` metadata and an existing `venv`
-recursively for `parking_user`; it changes ownership only and never chmods
+Full setup recursively adopts the entire checkout for `parking_user`, including
+nested source/docs directories, `.git`, and an existing `venv`. It changes
+ownership only and never recursively chmods the checkout or chmods
 virtual-environment internals, so executable entry points remain intact. After
 full setup, run Git and Python package operations as `parking_user`. Existing
 hosts should install verified unit changes through the narrow upgrade path:

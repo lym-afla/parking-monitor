@@ -216,7 +216,7 @@ show_logs -t {component} >/dev/null
                 self.assertIn(log_name, logged_text)
                 self.assertNotIn("journalctl ", logged_text)
 
-    def test_setup_adopts_git_and_venv_ownership_without_chmodding_venv(self):
+    def test_setup_adopts_entire_checkout_without_chmodding_tree_or_venv(self):
         result, calls = self._run_sourced_script(
             SETUP_SCRIPT,
             """
@@ -225,8 +225,11 @@ VENV_DIR="$APP_DIR/venv"
 LOG_DIR="$APP_DIR/logs"
 CONFIG_DIR="$APP_DIR/config"
 APP_USER=parking_user
-mkdir -p "$VENV_DIR/bin" "$APP_DIR/.git" "$APP_DIR/scripts"
-touch "$VENV_DIR/bin/pip" "$APP_DIR/scripts/manage-parking-monitor.sh"
+mkdir -p "$VENV_DIR/bin" "$APP_DIR/.git" "$APP_DIR/scripts/nested" \
+         "$APP_DIR/tests/nested" "$APP_DIR/docs/nested"
+touch "$VENV_DIR/bin/pip" "$APP_DIR/scripts/manage-parking-monitor.sh" \
+      "$APP_DIR/scripts/nested/helper.sh" "$APP_DIR/tests/nested/test_helper.py" \
+      "$APP_DIR/docs/nested/runbook.md"
 chown() { printf 'chown %s\\n' "$*" >> "$CALL_LOG"; return 0; }
 chmod() { printf 'chmod %s\\n' "$*" >> "$CALL_LOG"; return 0; }
 sudo() {
@@ -241,15 +244,7 @@ setup_permissions >/dev/null
         self.assertTrue(
             any(
                 line.startswith("chown -R parking_user:parking_user ")
-                and line.endswith("/.git")
-                for line in calls
-            ),
-            calls,
-        )
-        self.assertTrue(
-            any(
-                line.startswith("chown -R parking_user:parking_user ")
-                and line.endswith("/venv")
+                and line.endswith("/app")
                 for line in calls
             ),
             calls,
@@ -257,6 +252,19 @@ setup_permissions >/dev/null
         for line in calls:
             if line.startswith("chmod "):
                 self.assertNotIn("/venv", line)
+                self.assertNotIn("/scripts", line)
+                self.assertNotIn("/tests", line)
+                self.assertNotIn("/docs", line)
+                self.assertNotIn(" -R ", f" {line} ")
+
+    def test_symlink_install_does_not_change_tracked_script_modes(self):
+        setup_source = SETUP_SCRIPT.read_text(encoding="utf-8")
+        symlink_function = setup_source.split("create_symlink() {", 1)[1]
+        symlink_function = symlink_function.split("# Enable services", 1)[0]
+
+        self.assertNotIn('chmod +x "$script_path"', symlink_function)
+        self.assertNotIn('chmod +x "$SYMLINK_PATH"', symlink_function)
+        self.assertIn('[ ! -x "$script_path" ]', symlink_function)
 
     def test_setup_stops_on_stage_failure_without_false_success(self):
         result, _ = self._run_sourced_script(
