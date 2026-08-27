@@ -1,9 +1,45 @@
 import time
 import json
 import sys
-from datetime import datetime
+import calendar
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from playwright.sync_api import sync_playwright
 from config import *
+
+MOSCOW_TIMEZONE = timezone(timedelta(hours=3), "MSK")
+MONTH_END_INTERVAL_SECONDS = 300
+
+
+def get_polling_schedule(now=None, normal_interval=CHECK_INTERVAL_SECONDS):
+    """Return the polling interval and mode for the supplied Moscow time."""
+    if now is None:
+        now = datetime.now(MOSCOW_TIMEZONE)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=MOSCOW_TIMEZONE)
+    else:
+        now = now.astimezone(MOSCOW_TIMEZONE)
+
+    last_day_number = calendar.monthrange(now.year, now.month)[1]
+    month_end = datetime(
+        now.year, now.month, last_day_number, tzinfo=MOSCOW_TIMEZONE
+    )
+    high_frequency_start = datetime.combine(
+        (month_end - timedelta(days=6)).date(),
+        datetime_time.min,
+        tzinfo=MOSCOW_TIMEZONE,
+    )
+    high_frequency_end = datetime.combine(
+        (month_end - timedelta(days=2)).date(),
+        datetime_time.min,
+        tzinfo=MOSCOW_TIMEZONE,
+    )
+
+    if high_frequency_start <= now < high_frequency_end:
+        return MONTH_END_INTERVAL_SECONDS, "month-end"
+    if now < high_frequency_start:
+        seconds_until_start = int((high_frequency_start - now).total_seconds())
+        return min(normal_interval, seconds_until_start), "normal"
+    return normal_interval, "normal"
 
 def log(message):
     """Print log message with timestamp"""
@@ -73,14 +109,8 @@ def main():
     initial_state = load_state()
     log(f"Loaded state: checks={initial_state.get('checks', 0)}, hits={initial_state.get('hits', 0)}, interval={initial_state.get('interval', CHECK_INTERVAL_SECONDS)}s")
 
-    initial_state = load_state()
-    log(f"Loaded state: checks={initial_state.get('checks', 0)}, hits={initial_state.get('hits', 0)}, interval={initial_state.get('interval', CHECK_INTERVAL_SECONDS)}s")
-
     while True:
         try:
-            # Reload state to pick up interval changes from Telegram bot
-            state = load_state()
-
             # Reload state to pick up interval changes from Telegram bot
             state = load_state()
 
@@ -98,8 +128,13 @@ def main():
             save_state(state)
 
 
-            interval = state.get("interval", CHECK_INTERVAL_SECONDS)
-            log(f"Check #{state['checks']} complete. Next check in {interval} seconds.")
+            interval, polling_mode = get_polling_schedule(
+                normal_interval=state.get("interval", CHECK_INTERVAL_SECONDS)
+            )
+            log(
+                f"Check #{state['checks']} complete. Polling mode: {polling_mode}. "
+                f"Next check in {interval} seconds."
+            )
 
         except Exception as e:
             log(f"ERROR: {str(e)}")
@@ -107,14 +142,16 @@ def main():
             traceback.print_exc()
             # Reload state to ensure we don't overwrite interval changes
             state = load_state()
-            # Reload state to ensure we don't overwrite interval changes
-            state = load_state()
             state["error"] = str(e)
             save_state(state)
-            interval = state.get("interval", CHECK_INTERVAL_SECONDS)
-            interval = state.get("interval", CHECK_INTERVAL_SECONDS)
+            interval, polling_mode = get_polling_schedule(
+                normal_interval=state.get("interval", CHECK_INTERVAL_SECONDS)
+            )
+            log(
+                f"Polling mode after error: {polling_mode}. "
+                f"Next check in {interval} seconds."
+            )
 
-        time.sleep(interval)
         time.sleep(interval)
 
 if __name__ == "__main__":
